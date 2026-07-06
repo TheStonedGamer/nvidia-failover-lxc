@@ -73,9 +73,12 @@ Proxmox host, installs the proxy as a systemd service, and binds it to `0.0.0.0`
 
 ### Standalone installers (no Python required)
 
-Prebuilt, self-contained builds are produced by GitHub Actions for every `v*`
-release ([`.github/workflows/build-installers.yml`](.github/workflows/build-installers.yml))
-and attached to the [Releases](../../releases) page:
+Prebuilt, self-contained builds are produced by GitHub Actions
+([`.github/workflows/build-installers.yml`](.github/workflows/build-installers.yml))
+and attached to the [Releases](../../releases) page. **Every push to `main`
+auto-publishes a rolling [`latest`](../../releases/tag/latest) prerelease** (the tag
+is moved to the newest build); pushing a `v*` tag publishes a permanent versioned
+release:
 
 | Platform | Download | Notes |
 | --- | --- | --- |

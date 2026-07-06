@@ -2,16 +2,27 @@ name: Build self-contained installers
 
 # Builds standalone, no-Python-required executables and native installers for
 # Windows, macOS (Intel + Apple Silicon) and Linux (AppImage) with PyInstaller.
-# Runs on every v* tag (assets are attached to the GitHub Release) and can be
-# triggered manually (assets are uploaded as workflow artifacts).
+# Every push to main auto-publishes a rolling "latest" release; pushing a v*
+# tag publishes a permanent versioned release. Also runnable manually.
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
+    paths:
+      - "nvidia_failover_proxy.py"
+      - "requirements.txt"
+      - "packaging/**"
+      - ".github/workflows/build-installers.yml"
   workflow_dispatch:
 
 permissions:
   contents: write
+
+# One release at a time; cancel superseded main builds.
+concurrency:
+  group: installers-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -39,6 +50,17 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
+
+      # Version: v-tag -> that version; otherwise 0.0.<run_number> rolling build.
+      - name: Compute version
+        id: ver
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=0.0.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          fi
 
       # ---- Build the one-file executable (all platforms) --------------------
       - name: Build executable (Windows)
@@ -69,8 +91,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $ver = "${{ github.ref_name }}".TrimStart('v')
-          if (-not $ver) { $ver = "0.0.0" }
+          $ver = "${{ steps.ver.outputs.value }}"
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DMyAppVersion=$ver packaging\windows-installer.iss
           New-Item -ItemType Directory -Force out | Out-Null
           Copy-Item dist\nvidia-failover-proxy.exe "out\nvidia-failover-proxy-${{ matrix.target }}.exe"
@@ -116,8 +137,36 @@ jobs:
           name: ${{ matrix.target }}
           path: out/*
 
-      - name: Attach to release
+  # Single release job so the 4 matrix builds don't race to create the release.
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-artifacts
+
+      - name: Collect assets
+        run: |
+          mkdir -p release
+          find dist-artifacts -type f -exec cp {} release/ \;
+          ls -la release
+
+      # Tag push -> permanent versioned release.
+      - name: Publish tagged release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: out/*
+          files: release/*
+
+      # main push / manual -> rolling "latest" prerelease, tag moved each time.
+      - name: Publish rolling latest release
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "Latest build (0.0.${{ github.run_number }})"
+          prerelease: true
+          body: "Automated build from ${{ github.sha }} on ${{ github.ref_name }}. This release is overwritten on every push to main."
+          files: release/*
