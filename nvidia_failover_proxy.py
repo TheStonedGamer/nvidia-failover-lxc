@@ -1288,7 +1288,8 @@ async def _fetch_model_ids(base_url: str, key: Optional[str]) -> dict:
         )
         return {"models": ids}
     except (httpx.HTTPError, ValueError, KeyError) as e:
-        return {"error": str(e)[:140]}
+        msg = str(e).strip() or type(e).__name__
+        return {"error": msg[:140]}
 
 
 @app.get("/_models/available")
