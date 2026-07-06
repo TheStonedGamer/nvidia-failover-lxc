@@ -35,6 +35,7 @@ Run:
 """
 
 import asyncio
+import base64
 import json
 import os
 import time
@@ -897,6 +898,22 @@ def _fmt_num(n) -> str:
     return f"{int(n):,}" if n else "—"
 
 
+# Stylized green-on-black "eye" mark (NVIDIA brand colors, #76b900) — used as the
+# browser-tab favicon and the header logo on the dashboard.
+_NV_LOGO_SVG = (
+    '<svg class=nvlogo viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg">'
+    '<rect width="120" height="120" rx="24" fill="#0b0d10"/>'
+    '<path fill="#76b900" d="M32 58 C32 41 47 31 65 33 '
+    'C51 39 45 50 47 63 C49 78 62 84 78 79 '
+    'C66 92 45 92 34 80 C27 73 28 63 32 58 Z"/>'
+    '<circle cx="80" cy="46" r="7" fill="#76b900"/>'
+    "</svg>"
+)
+_NV_FAVICON = "data:image/svg+xml;base64," + base64.b64encode(
+    _NV_LOGO_SVG.encode("utf-8")
+).decode("ascii")
+
+
 CFG_SCRIPT = """<script>
 (function(){
   var list=document.getElementById("cfglist");
@@ -1083,6 +1100,7 @@ async def dashboard() -> str:
     cfg_html = "".join(cfg_items)
     html = f"""<!doctype html><html><head><meta charset=utf-8>
 <title>NVIDIA failover proxy — live updates</title>
+<link rel="icon" type="image/svg+xml" href="{_NV_FAVICON}">
 <style>
 body{{font:14px/1.45 system-ui,Segoe UI,sans-serif;background:#0f1115;color:#e6e6e6;margin:0;padding:22px}}
 body.online{{opacity:1; animation:online 2s infinite ease-in-out}}
@@ -1098,6 +1116,9 @@ td.num{{text-align:right;font-variant-numeric:tabular-nums}}
 tr.tot td{{border-top:2px solid #2a2f3a;font-weight:600;color:#c8cfda}}
 .ok{{color:#2e7d32}} .bad{{color:#b71c1c}}
 .live{{color:#2e7d32}} .dead{{color:#b71c1c}} .connection{{font-size:9px;margin-left:8px;color:#5b6472}}
+h1{{display:flex;align-items:center;gap:10px}}
+svg.nvlogo{{width:30px;height:30px;flex:0 0 auto}}
+.nvbrand{{color:#76b900;font-weight:700;letter-spacing:.01em}}
 details#cfgpanel{{max-width:1280px;margin:0 0 18px;background:#141822;border:1px solid #232733;border-radius:8px;padding:6px 12px}}
 details#cfgpanel summary{{cursor:pointer;color:#c8cfda;font-weight:600;font-size:13px;padding:6px 0}}
 ul#cfglist{{list-style:none;margin:8px 0;padding:0;max-width:640px}}
@@ -1145,7 +1166,7 @@ src.onerror=function(){{
  setInterval(chk,1000);
 }})();
 </script></head><body>
-<h1>NVIDIA failover proxy — live state <span class=connection style="font-size:10px">connecting...</span></h1>
+<h1>{_NV_LOGO_SVG}<span><span class=nvbrand>NVIDIA</span> failover proxy — live state <span class=connection style="font-size:10px">connecting...</span></span></h1>
 <div class=sub>key {"<span class=ok>loaded</span>" if key_ok else "<span class=bad>missing</span>"}
  · live updates via SSE · models: auto, only, refine (+local refiner), local-only, local-refine, agent-*<span id=timer style="margin-left:10px;color:#5b6472">0s</span></div>
 <details id=cfgpanel open><summary>&#9881; Failover ladder — drag to reorder, uncheck to disable</summary>
