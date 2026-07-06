@@ -234,7 +234,9 @@ EnvironmentFile=/opt/nvidia-failover/proxy.env
 ExecStart=/opt/nvidia-failover/.venv/bin/python /opt/nvidia-failover/nvidia_failover_proxy.py
 Restart=always
 RestartSec=5
-TimeoutStopSec=10
+# Keep restarts snappy — the SSE dashboard connections drain on disconnect, but
+# cap the wait so a redeploy never leaves the proxy unreachable for long.
+TimeoutStopSec=15
 
 [Install]
 WantedBy=multi-user.target

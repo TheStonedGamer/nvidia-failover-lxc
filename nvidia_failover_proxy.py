@@ -116,6 +116,13 @@ AUTO_MODEL = "nvidia-auto"  # cloud frontier ladder, then local 80B tail rung
 ONLY_MODEL = "nvidia-only"  # cloud frontier ladder ONLY; 429 when all cooling
 REFINER_MODEL_ID = "nvidia-refine"  # cloud ladder + local Qwen 4b prompt refiner
 _MODEL_COOLDOWN_S = 5 * 60  # sideline a 429'd model this long (or its retry-after)
+# A failure to *connect* (vs. a 429 or a hung/slow model) is usually a transient
+# network blip — NVIDIA publishes several A records and a fresh connection often
+# lands on a healthy one. We retry the connect once and, if it still fails, only
+# briefly sideline the model instead of cooling it for 5 minutes, so one blip
+# can't drain the whole ladder and hard-fail an in-flight request.
+_CONNECT_COOLDOWN_S = 20
+_CONNECT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 
 # Agent profile model IDs — same cloud ladder but inject a role system prompt.
 # OpenCode picks these up as separate models for multi-agent workflows.
@@ -1158,11 +1165,15 @@ async def _live_tbody() -> str:
 
 
 @app.get("/updates")
-async def updates():
+async def updates(request: Request):
     """Server-sent events: pushes tbody HTML every 0.5 seconds."""
 
     async def watch_stats():
-        while True:
+        # Honor client disconnect so closed dashboard tabs don't leak a coroutine
+        # and, crucially, so `systemctl restart` doesn't hang ~90s waiting for
+        # these long-lived connections to drain (which briefly makes the proxy
+        # unreachable and drops in-flight OpenCode requests).
+        while not await request.is_disconnected():
             await asyncio.sleep(0.5)  # sub-second push for snappy feel
             tbody = await _live_tbody()
             yield f"data: {sse_escape(tbody)}\n\n"
@@ -2204,19 +2215,33 @@ async def chat_completions(request: Request):
         for model in ladder:
             tried.append(model)
             base_url, headers = _route(model)
-            stats.record_request(model)
-            try:
-                resp = await client.post(
-                    f"{base_url}/chat/completions",
-                    headers=headers,
-                    json=_prep_body(body, model),
-                )
-            except httpx.HTTPError as e:
-                stats.record_error(model)
-                cascade.cool(model, _MODEL_COOLDOWN_S)
-                print(
-                    f"[proxy] {model}: {type(e).__name__}; cooling {_MODEL_COOLDOWN_S}s; next"
-                )
+            resp = None
+            for attempt in range(2):  # attempt 1 is the connect-retry
+                stats.record_request(model)
+                try:
+                    resp = await client.post(
+                        f"{base_url}/chat/completions",
+                        headers=headers,
+                        json=_prep_body(body, model),
+                    )
+                    break
+                except _CONNECT_ERRORS as e:
+                    if attempt == 0:
+                        print(f"[proxy] {model}: {type(e).__name__}; retrying")
+                        continue
+                    stats.record_error(model)
+                    cascade.cool(model, _CONNECT_COOLDOWN_S)
+                    print(
+                        f"[proxy] {model}: {type(e).__name__}; cooling {_CONNECT_COOLDOWN_S}s; next"
+                    )
+                except httpx.HTTPError as e:
+                    stats.record_error(model)
+                    cascade.cool(model, _MODEL_COOLDOWN_S)
+                    print(
+                        f"[proxy] {model}: {type(e).__name__}; cooling {_MODEL_COOLDOWN_S}s; next"
+                    )
+                    break
+            if resp is None:
                 continue
             if resp.status_code == 200:
                 data = resp.json()
@@ -2251,74 +2276,106 @@ async def chat_completions(request: Request):
 
 async def _stream_cascade(body: dict, ladder: List[str], timeout: httpx.Timeout):
     """Yield SSE bytes from the first model that connects with 200; on a 429/EOL
-    at connect time, fail over to the next. (Mid-stream failure can't be retried
-    once bytes have been sent — that's inherent to streaming.)"""
+    or a connect failure, fail over to the next model.
+
+    Two robustness rules that keep OpenCode from stopping mid-task:
+      * A connect failure is retried once (fresh connection → likely a different
+        A record) and, if still failing, only short-cooled — a transient blip
+        can't drain the ladder and hard-fail the request.
+      * Once we've streamed real bytes to the client, an upstream error can NOT
+        restart on a fresh model (that would splice a second answer onto the
+        first). We end the SSE stream cleanly with [DONE] instead."""
+    client_sent = False  # have we delivered any content bytes to the client?
     async with httpx.AsyncClient(timeout=timeout) as client:
         for model in ladder:
             base_url, headers = _route(model)
-            stats.record_request(model)
-            try:
-                async with client.stream(
-                    "POST",
-                    f"{base_url}/chat/completions",
-                    headers=headers,
-                    json=_prep_body(body, model),
-                ) as resp:
-                    if resp.status_code != 200:
-                        await resp.aread()
-                        if resp.status_code in (401, 402, 403):
-                            msg = f"NVIDIA account gated ({resp.status_code})"
-                            yield _sse_error(msg)
-                            return
-                        cascade.note_status(
-                            model, resp.status_code, resp.headers.get("retry-after")
-                        )
-                        print(
-                            f"[proxy/stream] {model}: {resp.status_code}; failing over"
-                        )
-                        continue
-                    # Forward line-by-line (equivalent SSE framing) while sniffing
-                    # usage for token accounting. Buffer the leading chunks until
-                    # we see real content/tool_calls: if the stream ends without
-                    # any (an empty 200 completion), discard and fail over to the
-                    # next model instead of emitting nothing to the client.
-                    buffered: List[bytes] = []
-                    committed = not SKIP_EMPTY
-                    async for line in resp.aiter_lines():
-                        if line.startswith("data:"):
-                            payload = line[5:].strip()
-                            if payload and payload != "[DONE]":
-                                try:
-                                    obj = json.loads(payload)
-                                    if isinstance(obj, dict):
-                                        if obj.get("usage"):
-                                            stats.record_usage(model, obj["usage"])
-                                        if not committed and _delta_has_content(obj):
-                                            committed = True
-                                except ValueError:
-                                    pass
-                        emit = (line + "\n").encode("utf-8")
+            for attempt in range(2):  # attempt 1 is the connect-retry
+                stats.record_request(model)
+                try:
+                    async with client.stream(
+                        "POST",
+                        f"{base_url}/chat/completions",
+                        headers=headers,
+                        json=_prep_body(body, model),
+                    ) as resp:
+                        if resp.status_code != 200:
+                            await resp.aread()
+                            if resp.status_code in (401, 402, 403):
+                                yield _sse_error(
+                                    f"NVIDIA account gated ({resp.status_code})"
+                                )
+                                return
+                            cascade.note_status(
+                                model, resp.status_code, resp.headers.get("retry-after")
+                            )
+                            print(
+                                f"[proxy/stream] {model}: {resp.status_code}; failing over"
+                            )
+                            break  # not a connect issue — next model
+                        # Forward line-by-line (equivalent SSE framing) while
+                        # sniffing usage for token accounting. Buffer the leading
+                        # chunks until we see real content/tool_calls: if the
+                        # stream ends without any (an empty 200 completion),
+                        # discard and fail over instead of emitting nothing.
+                        buffered: List[bytes] = []
+                        committed = not SKIP_EMPTY
+                        async for line in resp.aiter_lines():
+                            if line.startswith("data:"):
+                                payload = line[5:].strip()
+                                if payload and payload != "[DONE]":
+                                    try:
+                                        obj = json.loads(payload)
+                                        if isinstance(obj, dict):
+                                            if obj.get("usage"):
+                                                stats.record_usage(model, obj["usage"])
+                                            if not committed and _delta_has_content(obj):
+                                                committed = True
+                                    except ValueError:
+                                        pass
+                            emit = (line + "\n").encode("utf-8")
+                            if committed:
+                                for b in buffered:
+                                    yield b
+                                buffered.clear()
+                                yield emit
+                                client_sent = True
+                            else:
+                                buffered.append(emit)
                         if committed:
-                            for b in buffered:
-                                yield b
-                            buffered.clear()
-                            yield emit
-                        else:
-                            buffered.append(emit)
-                    if committed:
-                        stats.record_success(model)
-                        print(f"[proxy/stream] served by {model}")
-                        return
+                            stats.record_success(model)
+                            print(f"[proxy/stream] served by {model}")
+                            return
+                        stats.record_error(model)
+                        print(f"[proxy/stream] {model}: empty stream; failing over")
+                        break  # next model
+                except _CONNECT_ERRORS as e:
+                    # Connect never established, so nothing was sent. Retry once on
+                    # a fresh connection, then only briefly sideline the model.
+                    if attempt == 0:
+                        print(f"[proxy/stream] {model}: {type(e).__name__}; retrying")
+                        continue
                     stats.record_error(model)
-                    print(f"[proxy/stream] {model}: empty stream; failing over")
-                    continue
-            except httpx.HTTPError as e:
-                stats.record_error(model)
-                cascade.cool(model, _MODEL_COOLDOWN_S)
-                print(
-                    f"[proxy/stream] {model}: {type(e).__name__}; cooling {_MODEL_COOLDOWN_S}s; next"
-                )
-                continue
+                    cascade.cool(model, _CONNECT_COOLDOWN_S)
+                    print(
+                        f"[proxy/stream] {model}: {type(e).__name__}; cooling {_CONNECT_COOLDOWN_S}s; next"
+                    )
+                    break
+                except httpx.HTTPError as e:
+                    stats.record_error(model)
+                    if client_sent:
+                        # Partial answer already delivered — can't cleanly restart
+                        # on another model. End the stream so the client sees a
+                        # finished (if truncated) message rather than corruption.
+                        print(
+                            f"[proxy/stream] {model}: {type(e).__name__} mid-stream; ending cleanly"
+                        )
+                        yield b"data: [DONE]\n\n"
+                        return
+                    cascade.cool(model, _MODEL_COOLDOWN_S)
+                    print(
+                        f"[proxy/stream] {model}: {type(e).__name__}; cooling {_MODEL_COOLDOWN_S}s; next"
+                    )
+                    break
         yield _sse_error("all frontier models unavailable")
 
 
