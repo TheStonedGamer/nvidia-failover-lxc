@@ -1,373 +1,1633 @@
-"""NVIDIA frontier-model failover proxy with SSE dashboard.
+"""NVIDIA frontier-model failover proxy.
 
-- Cascades through NVIDIA's frontier models on 429/timeout
-- Falls back to local Ollama model when cloud tier is rate-limited
-- Server-sent events dashboard (/updates)
-- Agent profiles, prompt refiner, /pick override, /commands
+A tiny OpenAI-compatible endpoint you can point OpenCode (or anything that
+speaks the OpenAI chat API) at. It forwards to NVIDIA's hosted API
+(integrate.api.nvidia.com) and **auto-cycles through the frontier models**:
+when one is rate-limited (429) or dead (404/410), the same request transparently
+fails over to the next model in the ladder. Works for both streaming and
+non-streaming requests. Rate-limited models are sidelined on a short cooldown
+and rejoin the ladder automatically.
 
-Multiple concurrent requests supported via:
-- Async httpx.AsyncClient for NVIDIA + Ollama with connection pooling
-- Stats snapshot rotation, atomic stats persistence
-- Configurable max concurrency (PROXY_CONCURRENCY)
+**Local tail rung:** a local Ollama model (default the qwen3-coder-next-80b in
+Ollama) sits at the *end* of the ladder, so when the whole NVIDIA frontier tier
+is rate-limited for the time being, the request keeps going on your local model
+instead of failing — and picks the cloud models back up as soon as their
+cooldowns expire. Disable with `PROXY_LOCAL_FALLBACK=0`.
 
-Like:
-```bash
-curl -d '{"model":"nvidia-auto","messages":[{"role":"user","content":"/models"}]}' \
-  http://<container>:5002/v1/chat/completions
-```
+**Context is preserved across every switch.** The proxy is stateless: the client
+(OpenCode) resends the full `messages` history each turn and the proxy forwards
+it verbatim to whichever model serves. So a conversation that starts on a cloud
+frontier model, fails over to another, and eventually lands on the local model
+carries its entire context along — no state is dropped at any hop.
+
+Point OpenCode at it:
+    base URL   http://127.0.0.1:5002/v1
+    api key    anything (the real nvapi- key is resolved server-side)
+    model      "nvidia-auto"  (start at the top of the ladder)
+               or any real NVIDIA model id (tried first, then cascades)
+
+Run:
+    NVIDIA_API_KEY resolves from env, else from ~/.config/opencode/opencode.jsonc
+    E:\\Projects\\model-router\\.venv\\Scripts\\python.exe nvidia_failover_proxy.py
+    # optional overrides:
+    #   PROXY_PORT=5002
+    #   ROUTER_NVIDIA_MODELS="deepseek-ai/deepseek-v4-pro,qwen/qwen3.5-397b-a17b,..."
 """
 
 import asyncio
-import collections
-import contextlib
 import json
 import os
 import time
-from typing import Deque, Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel
-from typing_extensions import Literal
 
-from src.providers.nvidia import resolve_api_key, _ladder
+from src.providers.nvidia import resolve_api_key
 
-# --- Constants ---------------------------------------------------------------------------------
-AUTO_MODEL = "nvidia-auto"       # cloud frontier ladder → tail local 80B
-ONLY_MODEL = "nvidia-only"       # cloud frontier ladder ONLY; 429 when all cooling (no fallback)
-REFINER_MODEL_ID = "nvidia-refine" # cloud ladder + local Qwen 4b prompt refiner
-LOCAL_ONLY = "local-only"       # local 80B only (no cloud)
-LOCAL_REFINE = "local-refine"    # refiner + local 80B
+NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 
-# Agent profiles — inject system prompt
+# Curated frontier ladder — the top-tier flagship chat/reasoning models on the
+# NVIDIA hosted API, strongest first (verified present 2026-07-06 via /v1/models).
+# Any model that ever returns 404/410 is dropped automatically at runtime, so a
+# stale entry here is harmless. Override wholesale with ROUTER_NVIDIA_MODELS.
+FRONTIER_MODELS: List[str] = [
+    "deepseek-ai/deepseek-v4-pro",
+    "qwen/qwen3.5-397b-a17b",
+    "mistralai/mistral-large-3-675b-instruct-2512",
+    "nvidia/nemotron-3-ultra-550b-a55b",
+    "moonshotai/kimi-k2.6",
+    "z-ai/glm-5.2",
+    "minimaxai/minimax-m3",
+    "openai/gpt-oss-120b",
+    "nvidia/llama-3.1-nemotron-ultra-253b-v1",
+    "qwen/qwen3.5-122b-a10b",
+    "nvidia/nemotron-3-super-120b-a12b",
+    "mistralai/mistral-medium-3.5-128b",
+    "meta/llama-4-maverick-17b-128e-instruct",
+    "deepseek-ai/deepseek-v4-flash",
+    "meta/llama-3.3-70b-instruct",
+]
+
+AUTO_MODEL = "nvidia-auto"  # cloud frontier ladder, then local 80B tail rung
+ONLY_MODEL = "nvidia-only"  # cloud frontier ladder ONLY; 429 when all cooling
+REFINER_MODEL_ID = "nvidia-refine"  # cloud ladder + local Qwen 4b prompt refiner
+_MODEL_COOLDOWN_S = 5 * 60  # sideline a 429'd model this long (or its retry-after)
+
+# Agent profile model IDs — same cloud ladder but inject a role system prompt.
+# OpenCode picks these up as separate models for multi-agent workflows.
 AGENT_ROLES = {
-    "agent-planner": "You are a STRICT TASK PLANNER. Break requests into verifiable test steps. Never write code.",
-    "agent-builder": "You are a hands-on CODE EXECUTOR. Call the tool immediately; describe nothing first.",
-    "agent-reviewer": "You are a STRICT CODE AUDITOR. Reject unverified changes; LSP errors are blocking.",
+    "agent-planner": "You are a meticulous planning agent. Before answering, produce a clear numbered step-by-step plan. Then execute each step thoroughly.",
+    "agent-builder": "You are a builder agent. Implement solutions with clean, well-structured, production-ready code. Include error handling, logging, and tests.",
+    "agent-reviewer": "You are a review agent. Scrutinize code and plans for bugs, edge cases, security flaws, and performance issues. Be thorough but constructive.",
 }
-SPECIAL_IDS = {AUTO_MODEL, ONLY_MODEL, REFINER_MODEL_ID, LOCAL_ONLY, LOCAL_REFINE} | set(AGENT_ROLES)
+# Local model IDs — route directly to the local Ollama 80B instead of cloud.
+LOCAL_ONLY = "local-only"  # direct to local 80B
+LOCAL_REFINE = "local-refine"  # refiner → local 80B
 
-# --- Rate tracking -----------------------------------------------------------------------------
-class RateTracker:
-    """Thread-safe revolving usage window. No locks needed — deque appends are GIL-protected."""
-    __slots__ = ["window_s", "in_toks", "out_toks", "timestamps"]
+# Model override: set by the /pick command. When non-None, this model ID is
+# used for all subsequent requests (unless the request explicitly specifies one).
+_model_override: Optional[str] = None
 
-    def __init__(self, window_secs=60):
-        self.window_s = window_secs
-        self.in_toks: Deque[int] = collections.deque(maxlen=window_secs)
-        self.out_toks: Deque[int] = collections.deque(maxlen=window_secs)
-        self.timestamps: Deque[float] = collections.deque(maxlen=window_secs)
+# All special model IDs that trigger custom routing (not a real NVIDIA model).
+SPECIAL_IDS = {
+    AUTO_MODEL,
+    ONLY_MODEL,
+    REFINER_MODEL_ID,
+    LOCAL_ONLY,
+    LOCAL_REFINE,
+} | set(AGENT_ROLES)
 
-    @contextlib.contextmanager
-    def tick(self):
-        """Time a block of work."""
-        start_at = time.time()
-        yield
-        now = time.time()
-        elapsed = int((now - start_at - 1) // 1) + 1
-        self.timestamps.extend([now] * elapsed)
-
-    def record(self, input_toks: int, output_toks: int) -> None:
-        """Accumulate tokens into the rolling window."""
-        assert input_toks >= 0 and output_toks >= 0, "Negative tokens"
-        self.in_toks.append(input_toks)        # GIL-protected
-        self.out_toks.append(output_toks)
-
-    def _sum_recent(self, metric_deque: Deque[int], now_ts: Optional[float] = None) -> int:
-        """Sum tokens that fall into the active window."""
-        now = now_ts or time.time()
-        return sum(t for (t, v) in zip(self.timestamps, metric_deque) if now - 1 <= t <= now)
-
-    def rpm(self) -> int:
-        """Requests per minute."""
-        return len(self.timestamps)   # deque length equals last minute
-
-    def tpm_in(self) -> int:
-        """Token throughput input/min."""
-        return self._sum_recent(self.in_toks)
-
-    def tpm_out(self) -> int:
-        """Token throughput output/min."""
-        return self._sum_recent(self.out_toks)
-
-
-class Stats:
-    """Stats persistence with atomic save."""
-    filename = "proxy_stats.json"
-    KEYS = {"requests", "successes", "errors", "rate_limited", "tokens_in", "tokens_out", "retry_after_ewma", "last_rpm_ts"}
-
-    def __init__(self):
-        self.models = {"dead": []}
-        self.load()
-
-    def load(self):
-        if os.path.exists(self.filename):
-            with open(self.filename, "r") as f:
-                ext = json.load(f)
-                safe = {m: {k: v for (k, v) in stats.items() if k in self.KEYS} for m, stats in ext.items()}
-                self.models = safe
-
-    def save(self):
-        temp = f"{self.filename}.tmp"
-        with open(temp, "w") as f:
-            json.dump(self.models, f)
-        os.replace(temp, self.filename)  # atomic FS operation
-
-    @staticmethod
-    def default() -> Dict:
-        return {
-            "requests": 0,
-            "successes": 0,
-            "rate_limited": 0,
-            "errors": 0,
-            "tokens_in": 0,
-            "tokens_out": 0,
-            "last_rpm": 0,
-            "last_rpm_ts": 0,
-        }
-
-    def record_request(self, model: str):
-        if model not in self.models:
-            self.models[model] = self.default()
-        self.models[model]["requests"] += 1
-        self.models[model]["last_rpm_ts"] = time.time()
-        self.save()
-
-    def record_success(self, model: str, in_toks: int, out_toks: int):
-        self.models[model]["successes"] += 1
-        self.models[model]["tokens_in"] += in_toks
-        self.models[model]["tokens_out"] += out_toks
-        self.save()
-
-    def record_error(self, model: str):
-        self.models[model]["errors"] += 1
-        self.save()
-
-    def record_429(self, model: str, retry_after: Optional[int] = None):
-        """Learn cooldown and update stats."""
-        learnt = self.models[model].get("retry_after_ewma", 120)
-        curr = retry_after or learnt
-        updated = (0.6 * learnt + 0.4 * curr) if learnt else curr
-        self.models[model]["retry_after_ewma"] = updated
-        self.models[model]["rate_limited"] += 1
-        self.save()
-
-    def mark_dead(self, model: str):
-        """Never retry this model."""
-        self.models["dead"].append(model)
-        self.save()
-
-
-class Cascade:
-    """Async-ready ladder. Handles failover, cooldown, stats."""
-    def __init__(self, stats: Stats):
-        self.static = _ladder()
-        self.stats = stats
-        self.dead = set(stats.models.get("dead", []))
-        self.model_until: Dict[str, float] = {}         # cooldown timestamp
-        self.pool = asyncio.Semaphore(int(os.environ.get("PROXY_CONCURRENCY", "10")))
-
-    @property
-    def models(self) -> List[str]:
-        """Cleaned cloud models."""
-        return [m for m in self.static if m not in self.dead]
-
-    def cool(self, model: str, secs: float):
-        """Sideline a model (thread-safe)."""
-        until = time.time() + secs
-        self.model_until[model] = max(self.model_until.get(model, 0), until)
-
-    def order(self, model_id: str, timeout=90) -> List[str]:
-        """Build route ladder."""
-        if model_id in SPECIAL_IDS:
-            model_id = {
-                LOCAL_ONLY: LOCAL_MODEL,
-                LOCAL_REFINE: LOCAL_MODEL,
-                REFINER_MODEL_ID: AUTO_MODEL,
-            }.get(model_id, model_id)
-
-        if model_id == ONLY_MODEL:
-            return [m for m in self.models if m not in self.dead]
-        elif self.is_local(model_id):
-            return [LOCAL_MODEL]
-        else:          # AUTO_MODEL + any cloud model
-            out = []
-            now = time.time()
-            for m in self.models:
-                if m == model_id:
-                    out.insert(0, m)        # preferred first
-                elif now >= self.model_until.get(m, 0):
-                    out.append(m)
-            return out
-
-    def is_local(self, model: str) -> bool:
-        """Check if route should go to local Ollama."""
-        return BOOL_ENV("PROXY_LOCAL_FALLBACK") and (model == LOCAL_MODEL or model in (LOCAL_ONLY, LOCAL_REFINE))
-
-    def local_available(self) -> bool:
-        return BOOL_ENV("PROXY_LOCAL_FALLBACK") and LOCAL_MODEL not in self.dead
-
-    async def fetch(self, url, headers, payload=None) -> httpx.Response:
-        """HTTP fetch with connection pooling + timeout."""
-        async with self.pool:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(15, connect=20, read=timeout)) as client:
-                try:
-                    resp = await (client.post if payload else client.get)(url, headers=headers, json=payload)
-                    resp.raise_for_status()
-                    return resp
-                except Exception:
-                    raise Exception("HTTP error")
-
-    async def route(self, model: str, body: Dict) -> Dict:
-        """Dispatch to local|cloud and return response."""
-        is_loc = self.is_local(model)
-        headers = {"Content-Type": "application/json"}
-        url = {
-            False: "https://integrate.api.nvidia.com/v1/chat/completions",
-            True: f"{os.environ.get('LOCAL_OLLAMA_URL')}/chat/completions",
-        }[is_loc]
-
-        if not is_loc:
-            headers["Authorization"] = f"Bearer {resolve_api_key()}"
-
-        self.stats.record_request(model)
-        resp = await self.fetch(url, headers, payload=body)
-
-        data = resp.json()
-        if usage := data.get("usage"):
-            in_toks = usage.get("prompt_tokens", 0)
-            out_toks = usage.get("completion_tokens", 0)
-            self.stats.record_success(model, in_toks, out_toks)
-        else:
-            self.stats.record_error(model)
-        return data
-
-
-# --- Utils ----------------------------------------------------------------------------------
-BOOL_ENV = lambda k: os.environ.get(k, "1").lower() not in {"0", "false", "no", ""}
-REFINER_ENABLE = BOOL_ENV("REFINER_ENABLE")
-LOCAL_MODEL = os.environ.get("LOCAL_MODEL", "qwen3-coder-next:80b")
-LOCAL_BASE_URL = os.environ.get("LOCAL_OLLAMA_URL", "http://localhost:11434/v1")
-REFINER_BASE_URL = os.environ.get("REFINER_BASE_URL", LOCAL_BASE_URL)
+# Prompt refiner — a tiny local model that rewrites user prompts before they
+# reach the main model. Include `[refine]` anywhere in your message to activate.
+# The tag is stripped and the refiner's output becomes the new user message.
+REFINER_ENABLE = os.environ.get("PROXY_REFINER_ENABLE", "1").lower() not in (
+    "0",
+    "false",
+    "no",
+    "",
+)
+REFINER_BASE_URL = os.environ.get("REFINER_BASE_URL", "http://10.0.0.142:11434/v1")
 REFINER_MODEL = os.environ.get("REFINER_MODEL", "qwen3:4b")
 REFINER_TAG = os.environ.get("REFINER_TAG", "[refine]")
 
-# --- Persisted global state ----------------------------------------------------------------
-cascade = Cascade(Stats())
-_model_override = None  # /pick model picker
+# Local Ollama tail rung — used only when the whole cloud ladder is cooling.
+LOCAL_ENABLE = os.environ.get("PROXY_LOCAL_FALLBACK", "1").lower() not in (
+    "0",
+    "false",
+    "no",
+    "",
+)
+LOCAL_BASE_URL = os.environ.get("LOCAL_OLLAMA_URL", "http://127.0.0.1:11434/v1")
+LOCAL_MODEL = os.environ.get("LOCAL_MODEL", "Qwen3-Coder-Next-80b-A3B:latest")
 
-# --- Logic --------------------------------------------------------------------------------
-def _has_refine_tag(messages: List[Dict]) -> bool:
-    """Check '[refine]' in last user message."""
-    return REFINER_ENABLE and REFINER_TAG in messages[-1]["content"] if messages else False
+
+def _ladder() -> List[str]:
+    env = os.environ.get("ROUTER_NVIDIA_MODELS")
+    if env:
+        return [m.strip() for m in env.split(",") if m.strip()]
+    return list(FRONTIER_MODELS)
 
 
-async def _refine(content: str) -> str:
-    """Rewrite user message via small Ollama."""
-    body = {"model": REFINER_MODEL, "messages": [{"role": "user", "content": content}], "stream": False}
-    async with httpx.AsyncClient(timeout=25) as client:
+# --- Ladder config (user-reorderable + toggleable via web UI) -----------------------
+CONFIG_FILE = os.environ.get("PROXY_CONFIG_FILE", "proxy_config.json")
+
+
+class LadderConfig:
+    """Persists user-defined failover order + disabled models to proxy_config.json.
+
+    The web UI calls /_config GET to read and /_config POST to update.
+    Cascade.order() consults this to reorder / skip models.
+    """
+
+    def __init__(self) -> None:
+        self.order: List[str] = _ladder()
+        self.disabled: Set[str] = set()
+        self.load()
+
+    def load(self) -> None:
         try:
-            resp = await client.post(f"{REFINER_BASE_URL}/chat/completions", json=body)
-            resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"]
-        except Exception:
-            return content  # graceful fallback
+            if os.path.exists(CONFIG_FILE):
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data.get("order"), list):
+                    self.order = data["order"]
+                if isinstance(data.get("disabled"), list):
+                    self.disabled = set(data["disabled"])
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    def save(self) -> None:
+        tmp = f"{CONFIG_FILE}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(
+                {"order": self.order, "disabled": list(self.disabled)}, f, indent=2
+            )
+        os.replace(tmp, CONFIG_FILE)
+
+    def update(
+        self, order: Optional[List[str]] = None, disabled: Optional[List[str]] = None
+    ) -> None:
+        if order is not None:
+            self.order = order
+        if disabled is not None:
+            self.disabled = set(disabled)
+        self.save()
+
+    def is_enabled(self, model: str) -> bool:
+        return model not in self.disabled
+
+    def active_ladder(self) -> List[str]:
+        """Return models in user-defined order, excluding disabled ones."""
+        return [m for m in self.order if m not in self.disabled]
 
 
-app = FastAPI(title="nvidia-failover")
+ladder_config = LadderConfig()
 
-# --- API -----------------------------------------------------------------------------------
-@app.get("/dashboard", response_class=HTMLResponse)
-@app.get("/")
-async def dashboard():
-    """Live dashboard."""
-    rows = []
-    running_ts = time.time()
-    for model in cascade.models:
-        stats = cascade.stats.models.get(model, cascade.stats.default())
-        cooling = max(0, int(cascade.model_until.get(model, 0.0) - running_ts))
-        active = {
-            cooling == 0: "live",
-            cooling > 0: "cooling",
-        }.get(True, "dead")
-        rpm = len([t for t in chase.stats.models.get(model, {}).get("last_rpm_s", []) if running_ts - 60 < t <= running_ts])
-        rows.append({
-            "model": model,
-            "state": active,
-            "rpm": rpm,
-            "cooling": cooling,
-            "tokens_in": stats.get("tokens_in", 0),
-            "tokens_out": stats.get("tokens_out", 0),
-            "errors": stats.get("errors", 0),
-        })
 
-    # HTML UI with embed \u003cscript\u003e for live~SSE
-    return """
-    \n    """
+class Cascade:
+    """Holds the frontier ladder plus per-model rate-limit / EOL state."""
+
+    def __init__(self) -> None:
+        self.models = _ladder()  # cloud (NVIDIA) frontier ladder
+        self.local = LOCAL_MODEL if LOCAL_ENABLE else None
+        self.model_until: Dict[str, float] = {}  # model -> cooling-until epoch
+        self.dead: Set[str] = set()  # 404/410 — dropped permanently
+
+    def is_local(self, model: Optional[str]) -> bool:
+        return bool(self.local) and (
+            model == self.local or model in (LOCAL_ONLY, LOCAL_REFINE)
+        )
+
+    def order(self, preferred: Optional[str]) -> List[str]:
+        """Try `preferred` first (if it's a real, usable model), then cascade
+        through the rest of the cloud ladder (skipping dead / cooling models),
+        and finally the local model as the guaranteed tail rung — so when the
+        whole cloud tier is rate-limited the request still lands somewhere.
+
+        Special ids control tail behavior:
+          - AUTO_MODEL ("nvidia-auto"): cloud ladder, then the local 80B tail.
+          - ONLY_MODEL ("nvidia-only"): cloud ladder ONLY. 429 when all cooling.
+          - REFINER_MODEL_ID, AGENT_ROLES: same as nvidia-auto (cloud→local).
+          - LOCAL_ONLY ("local-only"): local 80B only, no cloud.
+          - LOCAL_REFINE ("local-refine"): refiner + local 80B (refiner runs upstream)."""
+        now = time.time()
+        cloud_only = preferred == ONLY_MODEL
+        # User-defined order + toggles from the web UI (proxy_config.json);
+        # fall back to the built-in ladder if the config is empty/all-disabled.
+        base = ladder_config.active_ladder() or list(self.models)
+        if preferred and preferred not in SPECIAL_IDS and not self.is_local(preferred):
+            base = [preferred] + [m for m in base if m != preferred]
+        cloud = [
+            m
+            for m in base
+            if m not in self.dead
+            and now >= self.model_until.get(m, 0.0)
+            and not stats.is_near_limit(m)
+        ]
+
+        # If the caller explicitly asked for the local model, honor it first.
+        # local-only and local-refine route ONLY to local (no cloud fallback).
+        if self.is_local(preferred):
+            local = self.local
+            if not local:
+                return []
+            if preferred in (LOCAL_ONLY, LOCAL_REFINE):
+                return [local]
+            return [local] + cloud
+
+        if cloud_only:
+            # Cloud-only: no local tail, no "closest to reviving" grace — if every
+            # cloud model is cooling, return empty so the caller returns 429.
+            return cloud
+
+        ladder = cloud + ([self.local] if self.local else [])
+        if not ladder:
+            # No local rung and every cloud model cooling: try the one closest
+            # to coming back rather than hard-failing.
+            alive = [m for m in base if m not in self.dead]
+            ladder = sorted(alive, key=lambda m: self.model_until.get(m, 0.0))[:1]
+        return ladder
+
+    def soonest_cooldown(self) -> int:
+        """Seconds until the nearest cloud model comes back (for retry-after)."""
+        now = time.time()
+        live = [
+            t for m, t in self.model_until.items() if m not in self.dead and t > now
+        ]
+        return int(min(live) - now) if live else _MODEL_COOLDOWN_S
+
+    def cool(self, model: str, secs: float) -> None:
+        """Sideline a model for `secs` (e.g. after a timeout/transport error)."""
+        self.model_until[model] = max(
+            self.model_until.get(model, 0.0), time.time() + secs
+        )
+
+    def note_status(self, model: str, status: int, retry_after: Optional[str]) -> None:
+        if status == 429:
+            stats.record_429(model, retry_after)
+            if retry_after and retry_after.isdigit():
+                secs = float(retry_after)
+            else:
+                # No Retry-After header: use what we've *learned* this model's
+                # cooldown to be, falling back to the flat default until we know.
+                secs = stats.learned_cooldown(model) or _MODEL_COOLDOWN_S
+            self.model_until[model] = time.time() + secs
+        elif status in (404, 410):
+            self.dead.add(model)
+        else:
+            stats.record_error(model)
+
+
+# ---- learned rate-limit tracker -------------------------------------------
+STATS_PATH = os.environ.get(
+    "PROXY_STATS_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxy_stats.json"),
+)
+_EWMA_ALPHA = 0.4  # weight on the newest observation
+_RPM_WINDOW_S = 60.0  # rolling window for requests-per-minute
+# Skip a model if its live rate is at/above this fraction of its learned ceiling.
+# 0.85 = give 15% headroom before we expect a throttle.
+_THROTTLE_RATIO = 0.85
+
+
+class Stats:
+    """Learns each model's rate-limit behavior from live traffic and persists it.
+
+    For every model it tracks:
+      - retry_after_ewma: learned cooldown seconds, from Retry-After headers when
+        present, else the measured gap between a 429 and the next success.
+      - limit_rpm: learned requests-per-minute ceiling — the rpm observed at the
+        moment a 429 fired, EWMA'd so it converges on the real throttle point.
+      - peak_rpm / counters for display.
+    Saved to proxy_stats.json so the learning survives restarts.
+    """
+
+    def __init__(self, data: Optional[dict] = None) -> None:
+        self.models: Dict[str, dict] = dict(data or {})
+        self._recent: Dict[str, List[float]] = {}
+        # Rolling token windows: list of (timestamp, token_count) tuples
+        self._recent_tok_in: Dict[str, List[tuple]] = {}
+        self._recent_tok_out: Dict[str, List[tuple]] = {}
+        self._last_save = 0.0
+
+    def _m(self, model: str) -> dict:
+        return self.models.setdefault(
+            model,
+            {
+                "requests": 0,
+                "successes": 0,
+                "rate_limited": 0,
+                "errors": 0,
+                "last_429": 0.0,
+                "last_success": 0.0,
+                "retry_after_ewma": 0.0,
+                "limit_rpm": None,
+                "peak_rpm": 0,
+                "limit_tpm_in": None,
+                "limit_tpm_out": None,
+                "peak_tpm_in": 0,
+                "peak_tpm_out": 0,
+                "tokens_in": 0,
+                "tokens_out": 0,
+                "tokens_total": 0,
+                "last_in": 0,
+                "last_out": 0,
+            },
+        )
+
+    def _rpm(self, model: str, now: float) -> int:
+        w = self._recent.setdefault(model, [])
+        cutoff = now - _RPM_WINDOW_S
+        while w and w[0] < cutoff:
+            w.pop(0)
+        return len(w)
+
+    def _tpm(self, window: Dict[str, List[tuple]], model: str, now: float) -> float:
+        """Sum tokens in the rolling window (per minute)."""
+        w = window.setdefault(model, [])
+        cutoff = now - _RPM_WINDOW_S
+        while w and w[0][0] < cutoff:
+            w.pop(0)
+        return sum(t[1] for t in w)
+
+    def _snapshot_tpm(self, model: str, now: float) -> tuple:
+        """Return (tpm_in, tpm_out) at the current instant."""
+        return (
+            self._tpm(self._recent_tok_in, model, now),
+            self._tpm(self._recent_tok_out, model, now),
+        )
+
+    def live_tpm_in(self, model: str) -> float:
+        return self._tpm(self._recent_tok_in, model, time.time())
+
+    def live_tpm_out(self, model: str) -> float:
+        return self._tpm(self._recent_tok_out, model, time.time())
+
+    def learned_tpm_in(self, model: str) -> Optional[float]:
+        m = self.models.get(model)
+        if m and m.get("limit_tpm_in") is not None:
+            return m["limit_tpm_in"]
+        return None
+
+    def learned_tpm_out(self, model: str) -> Optional[float]:
+        m = self.models.get(model)
+        if m and m.get("limit_tpm_out") is not None:
+            return m["limit_tpm_out"]
+        return None
+
+    def is_near_limit(self, model: str) -> bool:
+        """True if model's current throughput is at/above the learned ceiling."""
+        # RPM check
+        lim_rpm = self.models.get(model, {}).get("limit_rpm")
+        if lim_rpm is not None and self.live_rpm(model) >= lim_rpm * _THROTTLE_RATIO:
+            return True
+        # TPM-in check
+        lim_tpi = self.models.get(model, {}).get("limit_tpm_in")
+        if lim_tpi is not None and self.live_tpm_in(model) >= lim_tpi * _THROTTLE_RATIO:
+            return True
+        # TPM-out check
+        lim_tpo = self.models.get(model, {}).get("limit_tpm_out")
+        if (
+            lim_tpo is not None
+            and self.live_tpm_out(model) >= lim_tpo * _THROTTLE_RATIO
+        ):
+            return True
+        return False
+
+    def record_request(self, model: str) -> None:
+        now = time.time()
+        self._recent.setdefault(model, []).append(now)
+        m = self._m(model)
+        m["requests"] += 1
+        m["peak_rpm"] = max(m["peak_rpm"], self._rpm(model, now))
+
+    def record_success(self, model: str) -> None:
+        now = time.time()
+        m = self._m(model)
+        m["successes"] += 1
+        # A success right after a 429 reveals the actual cooldown length.
+        if (
+            m["last_429"]
+            and m["last_success"] < m["last_429"]
+            and now - m["last_429"] < 3600
+        ):
+            self._learn_cooldown(m, now - m["last_429"])
+        m["last_success"] = now
+        self._maybe_save()
+
+    def record_429(self, model: str, retry_after: Optional[str]) -> None:
+        now = time.time()
+        m = self._m(model)
+        m["rate_limited"] += 1
+        m["last_429"] = now
+        rpm = self._rpm(model, now)
+        if rpm > 0:  # rpm at a 429 is at/above the real ceiling — learn toward it
+            m["limit_rpm"] = (
+                rpm
+                if m["limit_rpm"] is None
+                else _EWMA_ALPHA * rpm + (1 - _EWMA_ALPHA) * m["limit_rpm"]
+            )
+        # Snapshot token throughput at the moment of throttle
+        tpi, tpo = self._snapshot_tpm(model, now)
+        if tpi > 0:
+            m["limit_tpm_in"] = (
+                tpi
+                if m["limit_tpm_in"] is None
+                else _EWMA_ALPHA * tpi + (1 - _EWMA_ALPHA) * m["limit_tpm_in"]
+            )
+        if tpo > 0:
+            m["limit_tpm_out"] = (
+                tpo
+                if m["limit_tpm_out"] is None
+                else _EWMA_ALPHA * tpo + (1 - _EWMA_ALPHA) * m["limit_tpm_out"]
+            )
+        if retry_after and str(retry_after).isdigit():
+            self._learn_cooldown(m, float(retry_after))
+        self._save()  # always persist rate-limit events
+
+    def record_error(self, model: str) -> None:
+        self._m(model)["errors"] += 1
+
+    def record_usage(self, model: str, usage: Optional[dict]) -> None:
+        """Accumulate token counts from an OpenAI `usage` block."""
+        if not usage:
+            return
+        m = self._m(model)
+        now = time.time()
+        pin = int(usage.get("prompt_tokens", 0) or 0)
+        pout = int(usage.get("completion_tokens", 0) or 0)
+        tot = int(usage.get("total_tokens", pin + pout) or (pin + pout))
+        m["tokens_in"] = m.get("tokens_in", 0) + pin
+        m["tokens_out"] = m.get("tokens_out", 0) + pout
+        m["tokens_total"] = m.get("tokens_total", 0) + tot
+        m["last_in"], m["last_out"] = pin, pout
+        # Feed rolling token windows for TPM tracking
+        self._recent_tok_in.setdefault(model, []).append((now, pin))
+        self._recent_tok_out.setdefault(model, []).append((now, pout))
+        tpi = self.live_tpm_in(model)
+        tpo = self.live_tpm_out(model)
+        m["peak_tpm_in"] = max(m.get("peak_tpm_in", 0), tpi)
+        m["peak_tpm_out"] = max(m.get("peak_tpm_out", 0), tpo)
+        self._maybe_save()
+
+    def _learn_cooldown(self, m: dict, secs: float) -> None:
+        if secs <= 0:
+            return
+        m["retry_after_ewma"] = (
+            secs
+            if m["retry_after_ewma"] <= 0
+            else _EWMA_ALPHA * secs + (1 - _EWMA_ALPHA) * m["retry_after_ewma"]
+        )
+
+    def learned_cooldown(self, model: str) -> Optional[float]:
+        m = self.models.get(model)
+        if m and m.get("retry_after_ewma", 0) > 0:
+            return m["retry_after_ewma"]
+        return None
+
+    def live_rpm(self, model: str) -> int:
+        return self._rpm(model, time.time())
+
+    def _maybe_save(self) -> None:
+        if time.time() - self._last_save > 10:
+            self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            with open(STATS_PATH, "w", encoding="utf-8") as f:
+                json.dump(self.models, f, indent=2)
+        except OSError:
+            pass
+
+    @classmethod
+    def load(cls) -> "Stats":
+        try:
+            with open(STATS_PATH, "r", encoding="utf-8") as f:
+                return cls(json.load(f))
+        except (OSError, ValueError):
+            return cls()
+
+
+cascade = Cascade()
+stats = Stats.load()
+app = FastAPI(title="nvidia-failover-proxy")
+
+
+def _headers() -> Dict[str, str]:
+    key = resolve_api_key()
+    return {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+
+
+def _route(model: str) -> tuple:
+    """(base_url, headers) for a model — local Ollama needs no auth."""
+    if cascade.is_local(model):
+        return LOCAL_BASE_URL, {"Content-Type": "application/json"}
+    return NVIDIA_BASE_URL, _headers()
+
+
+# ---------------------------------------------------------------------------
+# Prompt refiner — calls a tiny local model to rewrite user prompts before the
+# main model sees them. Activated by including `[refine]` anywhere in messages.
+# ---------------------------------------------------------------------------
+REFINER_SYSTEM = (
+    "You are a prompt engineering assistant. Rewrite the user's request into a "
+    "clear, structured, highly-specific prompt that will get the best possible "
+    "result from a large language model. Preserve the original intent. Add "
+    "context, break it into steps, and be explicit about the desired output "
+    "format. Output ONLY the rewritten prompt — no explanations, no greetings."
+)
+
+
+def _has_refine_tag(messages: List[dict]) -> bool:
+    """Check if any user message contains `[refine]` anywhere (in any msg)."""
+    if not REFINER_ENABLE:
+        return False
+    tag_lower = REFINER_TAG.lower()
+    for msg in messages:
+        if msg.get("role") == "user" and isinstance(msg.get("content"), str):
+            if tag_lower in msg["content"].lower():
+                return True
+    return False
+
+
+def _strip_refine_tag(text: str) -> str:
+    """Remove all occurrences of the refine tag (case-insensitive)."""
+    import re
+
+    return re.sub(re.escape(REFINER_TAG), "", text, flags=re.IGNORECASE).strip()
+
+
+async def _refine_prompt(messages: List[dict], timeout: httpx.Timeout) -> List[dict]:
+    """Send messages to the local refiner model and return improved messages.
+
+    The refiner sees the full conversation and produces an improved version of
+    the last user message. Returns a copy of messages with the last user message
+    replaced by the refiner's output (tag stripped from both).
+    """
+    out = list(messages)
+    # Find the last user message index
+    last_user_idx = -1
+    for i in range(len(out) - 1, -1, -1):
+        if out[i].get("role") == "user":
+            last_user_idx = i
+            break
+    if last_user_idx < 0:
+        return out  # no user message to refine
+
+    original = out[last_user_idx]
+    text = original.get("content", "")
+    if not isinstance(text, str) or not text.strip():
+        return out
+
+    # Strip tag from the outgoing message
+    cleaned = _strip_refine_tag(text)
+    out[last_user_idx] = {**original, "content": cleaned}
+
+    # Call the refiner
+    refiner_body = {
+        "model": REFINER_MODEL,
+        "messages": [
+            {"role": "system", "content": REFINER_SYSTEM},
+            {"role": "user", "content": cleaned},
+        ],
+        "max_tokens": 2048,
+        "temperature": 0.3,
+        "stream": False,
+    }
+    print(f"[refiner] calling {REFINER_MODEL} with {len(cleaned)} chars...")
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            # Warmup: unload whatever is in VRAM by loading the refiner model
+            # with keep_alive=0 (loads then immediately unloads). This forces
+            # Ollama to evict any other model from GPU memory first.
+            try:
+                await client.post(
+                    f"{REFINER_BASE_URL.rstrip('/v1')}/api/generate",
+                    json={"model": REFINER_MODEL, "prompt": "", "keep_alive": 0},
+                    timeout=httpx.Timeout(connect=10.0, read=10.0, write=5.0),
+                )
+            except Exception:
+                pass  # warmup failure is non-fatal; the real call below will still try
+
+            resp = await client.post(
+                f"{REFINER_BASE_URL}/chat/completions",
+                json=refiner_body,
+            )
+        if resp.status_code == 200:
+            data = resp.json()
+            improved = (
+                (data.get("choices") or [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
+            if improved:
+                print(f"[refiner] improved from {len(cleaned)} → {len(improved)} chars")
+                out[last_user_idx] = {**out[last_user_idx], "content": improved}
+            else:
+                print("[refiner] empty response, keeping original")
+        else:
+            print(f"[refiner] HTTP {resp.status_code}: {resp.text[:200]}")
+    except Exception as e:
+        print(f"[refiner] error: {type(e).__name__}: {e}")
+    return out
+
+
+# Fail over when a model returns a 200 but no usable output (NVIDIA occasionally
+# returns an empty completion / empty stream). Tool-call responses legitimately
+# carry empty content, so those count as "has content".
+SKIP_EMPTY = os.environ.get("PROXY_SKIP_EMPTY", "1").lower() not in (
+    "0",
+    "false",
+    "no",
+    "",
+)
+
+
+def _msg_has_content(msg: dict) -> bool:
+    if (msg.get("content") or "").strip():
+        return True
+    if msg.get("tool_calls"):
+        return True
+    return False
+
+
+def _resp_has_content(data: dict) -> bool:
+    choices = data.get("choices") or []
+    if not choices:
+        return False
+    return _msg_has_content(choices[0].get("message") or {})
+
+
+def _delta_has_content(obj: dict) -> bool:
+    choices = obj.get("choices") or []
+    if not choices:
+        return False
+    d = choices[0].get("delta") or {}
+    if (d.get("content") or "").strip():
+        return True
+    if d.get("tool_calls"):
+        return True
+    return False
+
+
+def _prep_body(body: dict, model: str) -> dict:
+    out = dict(body)
+    out["model"] = model
+    # NIM quirk: some models return empty content unless max_tokens is set.
+    out.setdefault("max_tokens", 8192)
+    # Streaming: ask for a final usage chunk so we can track tokens per model.
+    if out.get("stream"):
+        so = dict(out.get("stream_options") or {})
+        so.setdefault("include_usage", True)
+        out["stream_options"] = so
+    return out
 
 
 @app.get("/health")
-async def health():
+async def health() -> dict:
+    key = resolve_api_key()
+    agent_descs = {k: v.split(".")[0][:60] for k, v in AGENT_ROLES.items()}
     return {
-        "ok": bool(resolve_api_key()),
-        "models": len(cascade.models),
-        "local": LOCAL_MODEL if BOOL_ENV("PROXY_LOCAL_FALLBACK") else None,
-        "cooling": {m: int(t - time.time()) for m, t in cascade.model_until.items()},
+        "ok": bool(key),
+        "modes": {
+            AUTO_MODEL: "cloud ladder then local 80B",
+            ONLY_MODEL: "cloud ladder only, 429 when all cooling",
+            REFINER_MODEL_ID: f"cloud ladder + local {REFINER_MODEL} prompt refiner",
+            LOCAL_ONLY: "local 80B only, no cloud",
+            LOCAL_REFINE: f"[refine]→{REFINER_MODEL} → local 80B",
+            **agent_descs,
+        },
+        "models": cascade.models,
+        "local_fallback": cascade.local,
+        "refiner": {
+            "enabled": REFINER_ENABLE,
+            "model": REFINER_MODEL,
+            "tag": REFINER_TAG,
+        },
+        "cooling": {
+            m: int(t - time.time())
+            for m, t in cascade.model_until.items()
+            if t > time.time()
+        },
+        "dead": sorted(cascade.dead),
     }
+
+
+def _model_view() -> List[dict]:
+    """Per-model snapshot joining live cascade state with learned stats."""
+    now = time.time()
+    rows: List[dict] = []
+    names = list(cascade.models) + ([cascade.local] if cascade.local else [])
+    for name in names:
+        m = stats.models.get(name, {})
+        until = cascade.model_until.get(name, 0.0)
+        cooling = max(0, int(until - now)) if until > now else 0
+        if cascade.is_local(name):
+            state = "local"
+        elif name in cascade.dead:
+            state = "dead"
+        elif cooling:
+            state = "cooling"
+        else:
+            state = "live"
+        rows.append(
+            {
+                "model": name,
+                "state": state,
+                "cooling_s": cooling,
+                "requests": m.get("requests", 0),
+                "successes": m.get("successes", 0),
+                "rate_limited": m.get("rate_limited", 0),
+                "errors": m.get("errors", 0),
+                "live_rpm": stats.live_rpm(name),
+                "peak_rpm": m.get("peak_rpm", 0),
+                "learned_limit_rpm": (
+                    round(m["limit_rpm"], 1) if m.get("limit_rpm") is not None else None
+                ),
+                "live_tpm_in": round(stats.live_tpm_in(name), 0),
+                "live_tpm_out": round(stats.live_tpm_out(name), 0),
+                "peak_tpm_in": m.get("peak_tpm_in", 0),
+                "peak_tpm_out": m.get("peak_tpm_out", 0),
+                "learned_limit_tpm_in": (
+                    round(m["limit_tpm_in"], 0)
+                    if m.get("limit_tpm_in") is not None
+                    else None
+                ),
+                "learned_limit_tpm_out": (
+                    round(m["limit_tpm_out"], 0)
+                    if m.get("limit_tpm_out") is not None
+                    else None
+                ),
+                "learned_cooldown_s": (
+                    round(m["retry_after_ewma"], 1)
+                    if m.get("retry_after_ewma", 0) > 0
+                    else None
+                ),
+                "tokens_in": m.get("tokens_in", 0),
+                "tokens_out": m.get("tokens_out", 0),
+                "tokens_total": m.get("tokens_total", 0),
+                "last_in": m.get("last_in", 0),
+                "last_out": m.get("last_out", 0),
+            }
+        )
+    return rows
+
+
+@app.get("/stats")
+async def stats_json() -> dict:
+    return {
+        "models": _model_view(),
+        "window_s": int(_RPM_WINDOW_S),
+        "stats_file": STATS_PATH,
+    }
+
+
+def _fmt_tpm(val) -> str:
+    """Format a TPM number: integer with commas (0 is valid, show it)."""
+    return f"{int(val):,}"
+
+
+def _fmt_ceiling(val) -> str:
+    """Format a learned ceiling: human-readable int, or 'learning…'."""
+    return f"{int(val):,}/min" if val is not None else "learning…"
+
+
+async def _live_tbody() -> str:
+    """HTML <tr>...</tr> rows for the current stats snapshot, for SSE."""
+    rows = _model_view()
+    color = {
+        "live": "#2e7d32",
+        "cooling": "#e65100",
+        "dead": "#b71c1c",
+        "local": "#1565c0",
+    }
+    tot = {
+        "requests": 0,
+        "successes": 0,
+        "rate_limited": 0,
+        "tokens_in": 0,
+        "tokens_out": 0,
+        "tokens_total": 0,
+    }
+    trs = []
+    for i, r in enumerate(rows):
+        for k in tot:
+            tot[k] += r.get(k, 0)
+        avail = (
+            "now"
+            if r["state"] == "live"
+            else (
+                _fmt_dur(r["cooling_s"])
+                if r["state"] == "cooling"
+                else ("last rung" if r["state"] == "local" else "dropped")
+            )
+        )
+        limit_rpm = (
+            f"{r['learned_limit_rpm']}/min"
+            if r["learned_limit_rpm"] is not None
+            else "learning…"
+        )
+        cd = (
+            _fmt_dur(r["learned_cooldown_s"])
+            if r["learned_cooldown_s"]
+            else "learning…"
+        )
+        badge = f'<span style="color:{color.get(r["state"], "#555")};font-weight:600">{r["state"].upper()}</span>'
+        tin = (
+            f"{_fmt_num(r['tokens_in'])}<span class=dim> (+{r['last_in']})</span>"
+            if r["tokens_in"]
+            else "—"
+        )
+        tout = (
+            f"{_fmt_num(r['tokens_out'])}<span class=dim> (+{r['last_out']})</span>"
+            if r["tokens_out"]
+            else "—"
+        )
+        tpi = f"{_fmt_tpm(r['live_tpm_in'])} <span class=dim>(peak {_fmt_tpm(r['peak_tpm_in'])})</span>"
+        tpo = f"{_fmt_tpm(r['live_tpm_out'])} <span class=dim>(peak {_fmt_tpm(r['peak_tpm_out'])})</span>"
+        trs.append(
+            f"<tr><td class=n>{i + 1}</td><td class=m>{r['model']}</td><td>{badge}</td>"
+            f"<td>{avail}</td><td>{r['requests']}</td><td>{r['successes']}</td>"
+            f"<td>{r['rate_limited']}</td><td>{r['live_rpm']} <span class=dim>(peak {r['peak_rpm']})</span></td>"
+            f"<td>{limit_rpm}</td><td>{_fmt_ceiling(r['learned_limit_tpm_in'])}</td>"
+            f"<td>{_fmt_ceiling(r['learned_limit_tpm_out'])}</td><td>{tpi}</td><td>{tpo}</td>"
+            f"<td>{cd}</td>"
+            f"<td class=num>{tin}</td><td class=num>{tout}</td><td class=num>{_fmt_num(r['tokens_total'])}</td></tr>"
+        )
+    return "".join(trs)
+
+
+@app.get("/updates")
+async def updates():
+    """Server-sent events: pushes tbody HTML every 0.5 seconds."""
+
+    async def watch_stats():
+        while True:
+            await asyncio.sleep(0.5)  # sub-second push for snappy feel
+            tbody = await _live_tbody()
+            yield f"data: {sse_escape(tbody)}\n\n"
+
+    return StreamingResponse(
+        watch_stats(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+        background=None,
+    )
+
+
+def _fmt_dur(secs) -> str:
+    if not secs:
+        return "—"
+    secs = int(secs)
+    if secs < 60:
+        return f"{secs}s"
+    m, s = divmod(secs, 60)
+    return f"{m}m{s:02d}s"
+
+
+def _fmt_num(n) -> str:
+    return f"{int(n):,}" if n else "—"
+
+
+CFG_SCRIPT = """<script>
+(function(){
+  var list=document.getElementById("cfglist");
+  if(!list) return;
+  var dragEl=null;
+  list.addEventListener("dragstart",function(e){
+    dragEl=e.target.closest(".cfgrow");
+    if(dragEl) dragEl.classList.add("dragging");
+  });
+  list.addEventListener("dragend",function(){
+    if(dragEl) dragEl.classList.remove("dragging");
+    dragEl=null;
+  });
+  list.addEventListener("dragover",function(e){
+    e.preventDefault();
+    if(!dragEl) return;
+    var after=getAfter(list,e.clientY);
+    if(after==null) list.appendChild(dragEl);
+    else list.insertBefore(dragEl,after);
+  });
+  function getAfter(container,y){
+    var els=[].slice.call(container.querySelectorAll(".cfgrow:not(.dragging)"));
+    var closest={offset:-Infinity,el:null};
+    els.forEach(function(c){
+      var box=c.getBoundingClientRect();
+      var off=y-box.top-box.height/2;
+      if(off<0&&off>closest.offset){closest={offset:off,el:c};}
+    });
+    return closest.el;
+  }
+  function collect(){
+    var order=[],disabled=[];
+    [].slice.call(list.querySelectorAll(".cfgrow")).forEach(function(r){
+      var m=r.getAttribute("data-model");
+      order.push(m);
+      if(!r.querySelector(".tog").checked) disabled.push(m);
+    });
+    return {order:order,disabled:disabled};
+  }
+  var st=document.getElementById("cfgstatus");
+  document.getElementById("cfgsave").addEventListener("click",function(){
+    st.textContent="saving…";
+    fetch("/_config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(collect())})
+      .then(function(r){return r.json();})
+      .then(function(d){ st.textContent=d.ok?("saved — "+d.active.length+" active model(s)"):("error: "+(d.error||"?")); })
+      .catch(function(){ st.textContent="save failed"; });
+  });
+  document.getElementById("cfgreset").addEventListener("click",function(){ location.reload(); });
+})();
+</script>"""
+
+
+def _known_models() -> List[str]:
+    """Saved user order, with any newly-added built-in ladder models appended
+    so the config UI always shows every available cloud model."""
+    known = list(ladder_config.order)
+    for m in _ladder():
+        if m not in known:
+            known.append(m)
+    return known
+
+
+@app.get("/_config")
+async def get_config():
+    """Current failover order + disabled set for the web UI."""
+    return JSONResponse(
+        {
+            "order": _known_models(),
+            "disabled": sorted(ladder_config.disabled),
+        }
+    )
+
+
+@app.post("/_config")
+async def post_config(request: Request):
+    """Persist a user-defined failover order and/or disabled model set."""
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    order = body.get("order")
+    disabled = body.get("disabled")
+    if order is not None and (
+        not isinstance(order, list) or not all(isinstance(m, str) for m in order)
+    ):
+        return JSONResponse({"error": "order must be a list of strings"}, status_code=400)
+    if disabled is not None and (
+        not isinstance(disabled, list) or not all(isinstance(m, str) for m in disabled)
+    ):
+        return JSONResponse(
+            {"error": "disabled must be a list of strings"}, status_code=400
+        )
+    ladder_config.update(order=order, disabled=disabled)
+    return JSONResponse(
+        {
+            "ok": True,
+            "order": ladder_config.order,
+            "disabled": sorted(ladder_config.disabled),
+            "active": ladder_config.active_ladder(),
+        }
+    )
+
+
+@app.get("/", response_class=HTMLResponse)
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard() -> str:
+    rows = _model_view()
+    color = {
+        "live": "#2e7d32",
+        "cooling": "#e65100",
+        "dead": "#b71c1c",
+        "local": "#1565c0",
+    }
+    tot = {
+        "requests": 0,
+        "successes": 0,
+        "rate_limited": 0,
+        "tokens_in": 0,
+        "tokens_out": 0,
+        "tokens_total": 0,
+    }
+    trs = []
+    for i, r in enumerate(rows):
+        for k in tot:
+            tot[k] += r.get(k, 0)
+        avail = (
+            "now"
+            if r["state"] == "live"
+            else (
+                _fmt_dur(r["cooling_s"])
+                if r["state"] == "cooling"
+                else ("last rung" if r["state"] == "local" else "dropped")
+            )
+        )
+        limit_rpm = (
+            f"{r['learned_limit_rpm']}/min"
+            if r["learned_limit_rpm"] is not None
+            else "learning…"
+        )
+        cd = (
+            _fmt_dur(r["learned_cooldown_s"])
+            if r["learned_cooldown_s"]
+            else "learning…"
+        )
+        badge = f'<span style="color:{color.get(r["state"], "#555")};font-weight:600">{r["state"].upper()}</span>'
+        tin = (
+            f"{_fmt_num(r['tokens_in'])}<span class=dim> (+{r['last_in']})</span>"
+            if r["tokens_in"]
+            else "—"
+        )
+        tout = (
+            f"{_fmt_num(r['tokens_out'])}<span class=dim> (+{r['last_out']})</span>"
+            if r["tokens_out"]
+            else "—"
+        )
+        tpi = f"{_fmt_tpm(r['live_tpm_in'])} <span class=dim>(peak {_fmt_tpm(r['peak_tpm_in'])})</span>"
+        tpo = f"{_fmt_tpm(r['live_tpm_out'])} <span class=dim>(peak {_fmt_tpm(r['peak_tpm_out'])})</span>"
+        trs.append(
+            f"<tr><td class=n>{i + 1}</td><td class=m>{r['model']}</td><td>{badge}</td>"
+            f"<td>{avail}</td><td>{r['requests']}</td><td>{r['successes']}</td>"
+            f"<td>{r['rate_limited']}</td><td>{r['live_rpm']} <span class=dim>(peak {r['peak_rpm']})</span></td>"
+            f"<td>{limit_rpm}</td><td>{_fmt_ceiling(r['learned_limit_tpm_in'])}</td>"
+            f"<td>{_fmt_ceiling(r['learned_limit_tpm_out'])}</td><td>{tpi}</td><td>{tpo}</td>"
+            f"<td>{cd}</td>"
+            f"<td class=num>{tin}</td><td class=num>{tout}</td><td class=num>{_fmt_num(r['tokens_total'])}</td></tr>"
+        )
+    foot = (
+        f"<tr class=tot><td></td><td>TOTAL ({len(rows)} models)</td><td></td><td></td>"
+        f"<td>{tot['requests']}</td><td>{tot['successes']}</td><td>{tot['rate_limited']}</td>"
+        f"<td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td>"
+        f"<td class=num>{_fmt_num(tot['tokens_in'])}</td><td class=num>{_fmt_num(tot['tokens_out'])}</td>"
+        f"<td class=num>{_fmt_num(tot['tokens_total'])}</td></tr>"
+    )
+    key_ok = bool(resolve_api_key())
+    cfg_items = []
+    for m in _known_models():
+        checked = "" if m in ladder_config.disabled else "checked"
+        cfg_items.append(
+            f'<li class=cfgrow draggable=true data-model="{m}">'
+            f'<span class=grip>&#8942;&#8942;</span>'
+            f'<input type=checkbox class=tog {checked}>'
+            f'<span class=cfgname>{m}</span></li>'
+        )
+    cfg_html = "".join(cfg_items)
+    html = f"""<!doctype html><html><head><meta charset=utf-8>
+<title>NVIDIA failover proxy — live updates</title>
+<style>
+body{{font:14px/1.45 system-ui,Segoe UI,sans-serif;background:#0f1115;color:#e6e6e6;margin:0;padding:22px}}
+body.online{{opacity:1; animation:online 2s infinite ease-in-out}}
+body.offline{{opacity:.7; animation:none}}
+@keyframes online{{0%,10%,50%,80%,100%{{opacity:.8}} 30%{{opacity:.9}} 70%{{opacity:1}}}}
+h1{{font-size:18px;margin:0 0 2px}} .sub{{color:#8b95a5;font-size:12px;margin-bottom:16px}}
+table{{border-collapse:collapse;width:100%;max-width:1280px}}
+th,td{{padding:7px 10px;text-align:left;border-bottom:1px solid #232733}}
+th{{color:#8b95a5;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.04em}}
+td.n{{color:#5b6472}} td.m{{font-family:ui-monospace,Consolas,monospace;font-size:13px}}
+td.num{{text-align:right;font-variant-numeric:tabular-nums}}
+.dim{{color:#5b6472}} tr:hover td{{background:#161a22}}
+tr.tot td{{border-top:2px solid #2a2f3a;font-weight:600;color:#c8cfda}}
+.ok{{color:#2e7d32}} .bad{{color:#b71c1c}}
+.live{{color:#2e7d32}} .dead{{color:#b71c1c}} .connection{{font-size:9px;margin-left:8px;color:#5b6472}}
+details#cfgpanel{{max-width:1280px;margin:0 0 18px;background:#141822;border:1px solid #232733;border-radius:8px;padding:6px 12px}}
+details#cfgpanel summary{{cursor:pointer;color:#c8cfda;font-weight:600;font-size:13px;padding:6px 0}}
+ul#cfglist{{list-style:none;margin:8px 0;padding:0;max-width:640px}}
+li.cfgrow{{display:flex;align-items:center;gap:10px;padding:6px 10px;margin:4px 0;background:#0f1115;border:1px solid #232733;border-radius:6px;cursor:grab}}
+li.cfgrow.dragging{{opacity:.4;border-color:#1565c0}}
+li.cfgrow .grip{{color:#5b6472;cursor:grab;user-select:none;font-size:14px}}
+li.cfgrow .cfgname{{font-family:ui-monospace,Consolas,monospace;font-size:13px}}
+li.cfgrow input.tog:not(:checked) ~ .cfgname{{color:#5b6472;text-decoration:line-through}}
+.cfgbar{{display:flex;align-items:center;gap:12px;padding:6px 0 4px}}
+.cfgbar button{{background:#1565c0;color:#fff;border:0;border-radius:6px;padding:6px 14px;font:13px system-ui;cursor:pointer}}
+.cfgbar button#cfgreset{{background:#2a2f3a}}
+</style>
+<script>
+(function(){{
+ let b=document.body, t=document.getElementById("timer"), c=document.querySelector(".connection");
+ let lm=0, ils=0, rc, src;
+
+function beat(){{
+   lm=Date.now(); b.classList.add("online"); b.classList.remove("offline");
+   if(c) c.textContent="down-tick";
+  }}
+
+  function chk(){{
+   let now=Date.now();
+   if(now-lm>2000){{ b.classList.remove("online"); b.classList.add("offline"); if(c) c.textContent=rc?"disconnect":"wait"; }}
+   if(t){{ let d=(now-ils)/1000; t.textContent=d<2?((d*1000)|0)+"ms":(d|0)+"s"; }}
+  }}
+
+ function ssrc(){{
+  if(src) src.close();
+  src=new EventSource("/updates");
+  src.onmessage=function(e){{
+   var tb=document.querySelector("tbody");
+   if(tb) tb.innerHTML=e.data;
+   ils=Date.now(); beat();
+  }};
+src.onerror=function(){{
+    b.classList.remove("online"); b.classList.add("offline");
+    clearTimeout(rc); rc=setTimeout(ssrc,500);
+    src.close();
+   }};
+ }}
+
+ ils=Date.now(); ssrc(); beat();
+ setInterval(chk,1000);
+}})();
+</script></head><body>
+<h1>NVIDIA failover proxy — live state <span class=connection style="font-size:10px">connecting...</span></h1>
+<div class=sub>key {"<span class=ok>loaded</span>" if key_ok else "<span class=bad>missing</span>"}
+ · live updates via SSE · models: auto, only, refine (+local refiner), local-only, local-refine, agent-*<span id=timer style="margin-left:10px;color:#5b6472">0s</span></div>
+<details id=cfgpanel open><summary>&#9881; Failover ladder — drag to reorder, uncheck to disable</summary>
+<ul id=cfglist>{cfg_html}</ul>
+<div class=cfgbar><button id=cfgsave>Save order &amp; toggles</button><button id=cfgreset>Reload</button><span id=cfgstatus class=dim></span></div>
+</details>
+<table><thead><tr>
+<th>#</th><th>model</th><th>state</th><th>available</th><th>req</th><th>ok</th>
+<th>429s</th><th>rpm now</th><th>learned RPM</th><th>learned TPM in</th><th>learned TPM out</th>
+<th class=num>TPM in now</th><th class=num>TPM out now</th><th>learned cooldown</th>
+<th class=num>tokens in</th><th class=num>tokens out</th><th class=num>tokens total</th>
+</tr></thead><tbody>{"".join(trs)}</tbody><tfoot>{foot}</tfoot></table>
+</body></html>"""
+    return html.replace("</body>", CFG_SCRIPT + "</body>")
+
+
+@app.get("/v1/models")
+async def list_models() -> dict:
+    # Core modes + agent profiles + refiner + local-only + real NVIDIA models + local
+    special = [
+        AUTO_MODEL,
+        ONLY_MODEL,
+        REFINER_MODEL_ID,
+        LOCAL_ONLY,
+        LOCAL_REFINE,
+    ] + sorted(AGENT_ROLES)
+    ids = special + cascade.models + ([cascade.local] if cascade.local else [])
+    return {
+        "object": "list",
+        "data": [
+            {"id": m, "object": "model", "owned_by": "nvidia-failover-proxy"}
+            for m in ids
+        ],
+    }
+
+
+def _inject_agent_prompt(body: dict) -> dict:
+    """If the model is an agent role, inject its system prompt first."""
+    model = body.get("model", "")
+    sys_prompt = AGENT_ROLES.get(model)
+    if not sys_prompt:
+        return body
+    out = dict(body)
+    msgs = list(out.get("messages", []))
+    # Don't double-inject if the user already has a system message
+    has_sys = any(m.get("role") == "system" for m in msgs)
+    if not has_sys:
+        msgs.insert(0, {"role": "system", "content": sys_prompt})
+    out["messages"] = msgs
+    return out
+
+
+def _fmt_header(text: str) -> str:
+    return f"\n━━━ {text} ━━━\n\n"
+
+
+def _fmt_bold(text: str) -> str:
+    return f"**{text}**"
+
+
+def _get_last_user_msg(messages: List[dict]) -> Optional[str]:
+    """Return the text content of the most recent user message, or None."""
+    for msg in reversed(messages):
+        if msg.get("role") == "user" and isinstance(msg.get("content"), str):
+            return msg["content"].strip()
+    return None
+
+
+def _format_model_list() -> str:
+    """Pretty model listing with state badges."""
+    special = [
+        AUTO_MODEL,
+        ONLY_MODEL,
+        REFINER_MODEL_ID,
+        LOCAL_ONLY,
+        LOCAL_REFINE,
+    ] + sorted(AGENT_ROLES)
+    lines = [_fmt_header("Proxy Modes")]
+    for m in special:
+        desc = {
+            AUTO_MODEL: "cloud cascade → local 80B",
+            ONLY_MODEL: "cloud cascade only, 429 when all cooling",
+            REFINER_MODEL_ID: f"cloud cascade + [refine]→{REFINER_MODEL}",
+            LOCAL_ONLY: "local 80B only, no cloud",
+            LOCAL_REFINE: f"[refine]→{REFINER_MODEL} → local 80B",
+            **{k: v.split(".")[0] for k, v in AGENT_ROLES.items()},
+        }.get(m, "")
+        lines.append(f"  {m:<30} {desc}")
+    lines.append(_fmt_header("NVIDIA Frontier Ladder"))
+    now = time.time()
+    for m in cascade.models:
+        cooling = cascade.model_until.get(m, 0)
+        if m in cascade.dead:
+            tag = "☠ dead"
+        elif cooling > now:
+            tag = f"❄ {int(cooling - now)}s"
+        else:
+            tag = "✓ live"
+        lines.append(f"  {m:<55} {tag}")
+    if cascade.local:
+        lines.append(f"\n  {cascade.local:<55} local tail (always last)")
+    return "\n".join(lines)
+
+
+async def _handle_command(body: dict) -> Optional[JSONResponse]:
+    """Check if the last user message starts with / and handle it.
+
+    Returns a JSONResponse (command handled) or None (pass through).
+    """
+    global _model_override
+    text = _get_last_user_msg(body.get("messages", []))
+    if not text or not text.startswith("/"):
+        return None
+
+    parts = text[1:].split()
+    cmd = parts[0].lower() if parts else ""
+    args = parts[1:] if len(parts) > 1 else []
+
+    if cmd in ("help", "?"):
+        msg = (
+            _fmt_header("Proxy Commands")
+            + "Type any of these as your message:\n\n"
+            + "  /help          Show this help\n"
+            + "  /pick [N|off]  Interactive model picker (numbered list)\n"
+            + "  /stats         Current usage stats (rpms, tokens, cooling)\n"
+            + "  /models        List available models with state\n"
+            + "  /health        Proxy + key health\n"
+            + "  /cool <model>  Manually sideline a model for 5min\n"
+            + "  /uncool <model> Remove a model from cooldown\n"
+            + "  /switch <model> Hint to switch active model\n"
+        )
+
+    elif cmd == "stats":
+        rows = _model_view()
+        lines = [_fmt_header("Usage Stats (last 60s window)")]
+        for r in rows:
+            if r["requests"] == 0 and r["state"] == "live":
+                continue  # skip idle models for brevity
+            rpm = (
+                f"{r['live_rpm']}/{_fmt_tpm(r['learned_limit_rpm'])}"
+                if r["learned_limit_rpm"]
+                else f"{r['live_rpm']}/?"
+            )
+            tpi = (
+                f"{_fmt_tpm(r['live_tpm_in'])}/{_fmt_tpm(r['learned_limit_tpm_in'] or 0)}"
+                if r["learned_limit_tpm_in"]
+                else f"{_fmt_tpm(r['live_tpm_in'])}/?"
+            )
+            tpo = (
+                f"{_fmt_tpm(r['live_tpm_out'])}/{_fmt_tpm(r['learned_limit_tpm_out'] or 0)}"
+                if r["learned_limit_tpm_out"]
+                else f"{_fmt_tpm(r['live_tpm_out'])}/?"
+            )
+            state_icon = {"live": "✓", "cooling": "❄", "dead": "☠", "local": "⌂"}.get(
+                r["state"], "?"
+            )
+            lines.append(
+                f"  {state_icon} {r['model']:<50} RPM {rpm:<12} TPMi {tpi:<12} TPMo {tpo:<12} req={r['requests']} ok={r['successes']} 429={r['rate_limited']}"
+            )
+        msg = "\n".join(lines)
+
+    elif cmd == "models":
+        msg = _format_model_list()
+
+    elif cmd == "health":
+        key = resolve_api_key()
+        cooling = {
+            m: int(t - time.time())
+            for m, t in cascade.model_until.items()
+            if t > time.time()
+        }
+        msg = (
+            _fmt_header("Proxy Health")
+            + f"  API key: {'✓ loaded' if key else '✗ missing'}\n"
+            + f"  Dead models: {len(cascade.dead)}\n"
+            + f"  Cooling models: {len(cooling)}\n"
+            + f"  Ladder size: {len(cascade.models)} cloud + {'yes' if cascade.local else 'no'} local\n"
+            + f"  Refiner: {'enabled' if REFINER_ENABLE else 'disabled'} ({REFINER_MODEL})\n"
+        )
+
+    elif cmd == "cool" and args:
+        model = " ".join(args)
+        if model in cascade.models:
+            cascade.cool(model, _MODEL_COOLDOWN_S)
+            msg = f"  ❄ **{model}** sidelined for {_fmt_dur(_MODEL_COOLDOWN_S)}"
+        else:
+            msg = f"  ✗ Unknown model: {model}. Use /models to see valid models."
+
+    elif cmd == "uncool" and args:
+        model = " ".join(args)
+        if model in cascade.model_until:
+            cascade.model_until.pop(model, None)
+            msg = f"  ✓ **{model}** removed from cooldown"
+        else:
+            msg = f"  ✗ {model} is not on cooldown."
+
+    elif cmd == "switch" and args:
+        model = " ".join(args)
+        msg = f"  ↻ Switch hint noted: **{model}**\n  (OpenCode controls model selection; set it in the UI or config)"
+
+    elif cmd == "pick":
+        # Build numbered list of all available models
+        all_models = (
+            [AUTO_MODEL, ONLY_MODEL, REFINER_MODEL_ID, LOCAL_ONLY, LOCAL_REFINE]
+            + sorted(AGENT_ROLES)
+            + cascade.models
+            + ([cascade.local] if cascade.local else [])
+        )
+        now = time.time()
+
+        if args and args[0].isdigit():
+            idx = int(args[0]) - 1
+            if 0 <= idx < len(all_models):
+                picked = all_models[idx]
+                _model_override = picked
+                msg = f"  ✓ Picked **{picked}**\n  (Override set for subsequent messages. Use `/pick off` to clear.)"
+            else:
+                msg = f"  ✗ Invalid number. Use /pick to see available models (1-{len(all_models)})."
+        elif args and args[0].lower() == "off":
+            _model_override = None
+            msg = "  ✓ Model override cleared — using default model."
+        else:
+            current = _model_override or "(default)"
+            lines = [_fmt_header(f"Model Picker — current: {current}")]
+            lines.append("  Type `/pick N` to select, `/pick off` to clear:\n")
+            for idx, m in enumerate(all_models, 1):
+                # State badge
+                if m == _model_override:
+                    badge = " ◀"
+                elif m in cascade.dead:
+                    badge = " ☠"
+                elif m in (LOCAL_ONLY, LOCAL_REFINE) and cascade.local:
+                    badge = " ⌂"
+                elif (
+                    m in (AUTO_MODEL, ONLY_MODEL, REFINER_MODEL_ID) or m in AGENT_ROLES
+                ):
+                    badge = ""
+                elif cascade.model_until.get(m, 0) > now:
+                    badge = " ❄"
+                else:
+                    badge = ""
+                lines.append(f"  {idx:>2}. {m:<50}{badge}")
+            msg = "\n".join(lines)
+
+    else:
+        msg = (
+            _fmt_header("Unknown Command")
+            + f"  `/{cmd}` not recognized. Try /help for available commands.\n"
+        )
+
+    return JSONResponse(
+        {
+            "id": f"cmd-{int(time.time())}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": "proxy-commands",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": msg.strip(),
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
+    )
 
 
 @app.post("/v1/chat/completions")
-async def completions(req: Request):
-    body = await req.json()
-    preferred = body.get("model", AUTO_MODEL)
-    
-    # Model picker override
-    global _model_override
-    if _model_override and preferred in {None, AUTO_MODEL}:
+async def chat_completions(request: Request):
+    body = await request.json()
+    preferred = body.get("model")
+    stream = bool(body.get("stream"))
+
+    # ---- Commands: intercept /command in last user message ------------
+    cmd_resp = await _handle_command(body)
+    if cmd_resp is not None:
+        return cmd_resp
+
+    # ---- Model override: /pick sets a global default ------------------
+    if _model_override and (
+        preferred is None or preferred == AUTO_MODEL or preferred == ""
+    ):
         preferred = _model_override
 
-    # Commands intercept
-    if body["messages"].endswith("content").startswith("/"):
-        cmd, args = body["messages"][-1]["content"].strip("/"), ""
-        out = {
-            "model": "proxy-commands",
-            "choices": [{"message": {"content": _handle_command(cmd, args)} }]
-        }
-        return JSONResponse(out)
+    # ---- Agent system prompt injection --------------------------------
+    body = _inject_agent_prompt(body)
 
-    # Refiner
-    if _has_refine_tag(body["messages"]):
-        cleaned = body["messages"][-1]["content"].replace(REFINER_TAG, "").strip()
-        body["messages"][-1]["content"] = await _refine(cleaned)
+    # ---- Prompt refiner: triggered by [refine] tag ------------------------
+    should_refine = _has_refine_tag(body.get("messages", []))
+    if should_refine:
+        ref_timeout = httpx.Timeout(connect=5.0, read=30.0, write=15.0, pool=5.0)
+        body["messages"] = await _refine_prompt(body.get("messages", []), ref_timeout)
+        # Route through the appropriate ladder after refinement.
+        # If the user picked local-refine, keep routing to local only.
+        if preferred == LOCAL_REFINE:
+            effective_model = LOCAL_REFINE
+        else:
+            effective_model = AUTO_MODEL
+    else:
+        effective_model = preferred
 
-    # Dispatch
-    ladder = cascade.order(preferred)
-    for m in ladder:
-        try:
-            resp = await cascade.route(m, body)
-            resp["_proxy_model"] = m
-            return JSONResponse(resp)
-        except Exception:
-            continue
-    return JSONResponse({"error": "All ladder models cooling down"}, status_code=429)
+    ladder = cascade.order(effective_model)
+    if not ladder:
+        # Only reachable in nvidia-only mode: every cloud model is cooling and
+        # there is no local tail rung. Report a real rate-limit.
+        retry = cascade.soonest_cooldown()
+        msg = f"all NVIDIA frontier models are rate-limited; retry in ~{retry}s"
+        print(f"[proxy] nvidia-only exhausted; 429 (retry {retry}s)")
+        if stream:
+            return StreamingResponse(
+                _sse_once(_sse_error(msg)), media_type="text/event-stream"
+            )
+        return JSONResponse(
+            {
+                "error": {
+                    "message": msg,
+                    "type": "rate_limit_exceeded",
+                    "code": "rate_limited",
+                }
+            },
+            status_code=429,
+            headers={"Retry-After": str(retry)},
+        )
+    # Per-model read timeout: if a model stalls (slow/hung upstream), fail over
+    # to the next one instead of hanging the whole request. connect stays short
+    # so an unreachable rung (e.g. local Ollama down) is skipped near-instantly.
+    read_t = float(os.environ.get("PROXY_MODEL_TIMEOUT_S", "90"))
+    timeout = httpx.Timeout(connect=15.0, read=read_t, write=30.0, pool=15.0)
+
+    if stream:
+        return StreamingResponse(
+            _stream_cascade(body, ladder, timeout), media_type="text/event-stream"
+        )
+
+    # ---- non-streaming: try each model until one answers -------------------
+    tried: List[str] = []
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for model in ladder:
+            tried.append(model)
+            base_url, headers = _route(model)
+            stats.record_request(model)
+            try:
+                resp = await client.post(
+                    f"{base_url}/chat/completions",
+                    headers=headers,
+                    json=_prep_body(body, model),
+                )
+            except httpx.HTTPError as e:
+                stats.record_error(model)
+                cascade.cool(model, _MODEL_COOLDOWN_S)
+                print(
+                    f"[proxy] {model}: {type(e).__name__}; cooling {_MODEL_COOLDOWN_S}s; next"
+                )
+                continue
+            if resp.status_code == 200:
+                data = resp.json()
+                stats.record_usage(model, data.get("usage"))
+                if SKIP_EMPTY and not _resp_has_content(data):
+                    stats.record_error(model)
+                    print(f"[proxy] {model}: empty completion; failing over")
+                    continue
+                stats.record_success(model)
+                data["_proxy_model"] = model  # trace which model actually served
+                print(f"[proxy] served by {model}")
+                return JSONResponse(data)
+            if resp.status_code in (401, 402, 403):
+                # account-level — no other model will help
+                return JSONResponse(
+                    {
+                        "error": {
+                            "message": f"NVIDIA account gated ({resp.status_code}): {resp.text[:300]}"
+                        }
+                    },
+                    status_code=resp.status_code,
+                )
+            cascade.note_status(
+                model, resp.status_code, resp.headers.get("retry-after")
+            )
+            print(f"[proxy] {model}: {resp.status_code}; failing over")
+    return JSONResponse(
+        {"error": {"message": f"all frontier models unavailable; tried {tried}"}},
+        status_code=502,
+    )
 
 
-def _handle_command(cmd: str, args: str) -> str:
-    cmds = {
-        "help": _fmt_help,
-        "stats": _fmt_stats,
-        "pick": /pick,
-    }
-    return cmds.get(cmd, lambda _: "Unknown command (‘/help’)")(args)
+async def _stream_cascade(body: dict, ladder: List[str], timeout: httpx.Timeout):
+    """Yield SSE bytes from the first model that connects with 200; on a 429/EOL
+    at connect time, fail over to the next. (Mid-stream failure can't be retried
+    once bytes have been sent — that's inherent to streaming.)"""
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for model in ladder:
+            base_url, headers = _route(model)
+            stats.record_request(model)
+            try:
+                async with client.stream(
+                    "POST",
+                    f"{base_url}/chat/completions",
+                    headers=headers,
+                    json=_prep_body(body, model),
+                ) as resp:
+                    if resp.status_code != 200:
+                        await resp.aread()
+                        if resp.status_code in (401, 402, 403):
+                            msg = f"NVIDIA account gated ({resp.status_code})"
+                            yield _sse_error(msg)
+                            return
+                        cascade.note_status(
+                            model, resp.status_code, resp.headers.get("retry-after")
+                        )
+                        print(
+                            f"[proxy/stream] {model}: {resp.status_code}; failing over"
+                        )
+                        continue
+                    # Forward line-by-line (equivalent SSE framing) while sniffing
+                    # usage for token accounting. Buffer the leading chunks until
+                    # we see real content/tool_calls: if the stream ends without
+                    # any (an empty 200 completion), discard and fail over to the
+                    # next model instead of emitting nothing to the client.
+                    buffered: List[bytes] = []
+                    committed = not SKIP_EMPTY
+                    async for line in resp.aiter_lines():
+                        if line.startswith("data:"):
+                            payload = line[5:].strip()
+                            if payload and payload != "[DONE]":
+                                try:
+                                    obj = json.loads(payload)
+                                    if isinstance(obj, dict):
+                                        if obj.get("usage"):
+                                            stats.record_usage(model, obj["usage"])
+                                        if not committed and _delta_has_content(obj):
+                                            committed = True
+                                except ValueError:
+                                    pass
+                        emit = (line + "\n").encode("utf-8")
+                        if committed:
+                            for b in buffered:
+                                yield b
+                            buffered.clear()
+                            yield emit
+                        else:
+                            buffered.append(emit)
+                    if committed:
+                        stats.record_success(model)
+                        print(f"[proxy/stream] served by {model}")
+                        return
+                    stats.record_error(model)
+                    print(f"[proxy/stream] {model}: empty stream; failing over")
+                    continue
+            except httpx.HTTPError as e:
+                stats.record_error(model)
+                cascade.cool(model, _MODEL_COOLDOWN_S)
+                print(
+                    f"[proxy/stream] {model}: {type(e).__name__}; cooling {_MODEL_COOLDOWN_S}s; next"
+                )
+                continue
+        yield _sse_error("all frontier models unavailable")
 
 
-def _fmt_stats(*_) -> str:
-    """/stats"""
-    return """\nRPM: {}. TPM: {} in / {} out\n""".strip()
+async def _sse_once(payload: bytes):
+    yield payload
 
 
-# --- Main -----------------------------------------------------------------------------------
+def _sse_error(message: str) -> bytes:
+    payload = json.dumps({"error": {"message": message}})
+    return f"data: {payload}\n\ndata: [DONE]\n\n".encode("utf-8")
+
+
+def sse_escape(s: str) -> str:
+    """Escape newlines in SSE event data."""
+    return s.replace("\n", "\\n").replace("\r", "")
+
+
 if __name__ == "__main__":
-    host, port = "0.0.0.0", int(os.environ.get("PROXY_PORT", 5002))
+    import uvicorn
+
+    port = int(os.environ.get("PROXY_PORT", "5002"))
+    host = os.environ.get("PROXY_HOST", "127.0.0.1")
+    print(
+        f"NVIDIA failover proxy on http://{host}:{port}/v1  (models: {AUTO_MODEL} + {len(cascade.models)} frontier)"
+    )
     uvicorn.run(app, host=host, port=port)

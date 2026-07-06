@@ -101,6 +101,7 @@ WorkingDirectory=/root/model-router
 Environment=NVIDIA_API_KEY=$NVAPI_KEY
 Environment=REFINER_BASE_URL=http://$DESKTOP_IP:11434/v1
 Environment=LOCAL_OLLAMA_URL=http://$DESKTOP_IP:11434/v1
+Environment=PROXY_HOST=0.0.0.0
 ExecStart=/root/model-router/.venv/bin/python /root/model-router/nvidia_failover_proxy.py
 Restart=always
 RestartSec=10
@@ -109,8 +110,7 @@ RestartSec=10
 WantedBy=multi-user.target
 EOF
 
-# Fix host binding (0.0.0.0 for external access)
-sed -i "s/127.0.0.1/0.0.0.0/g" /root/model-router/nvidia_failover_proxy.py
+# Host binding for external access is handled via Environment=PROXY_HOST=0.0.0.0 above.
 
 systemctl daemon-reload
 systemctl enable nvidia-failover-proxy
