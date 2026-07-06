@@ -28,7 +28,7 @@ it and get resilient, multi-provider inference behind a single endpoint.
 docker run -d --name nvidia-failover-proxy \
   -p 5002:5002 \
   -v proxy-data:/data \
-  thestonedgamer/nvidia-failover-proxy:latest
+  shinyjesus/nvidia-failover-proxy:latest
 ```
 
 Then open **http://localhost:5002/** and add a provider under
@@ -41,7 +41,7 @@ Optionally seed an NVIDIA provider at first run:
 docker run -d --name nvidia-failover-proxy \
   -p 5002:5002 -v proxy-data:/data \
   -e NVIDIA_API_KEY=nvapi-xxxxxxxx \
-  thestonedgamer/nvidia-failover-proxy:latest
+  shinyjesus/nvidia-failover-proxy:latest
 ```
 
 ### Docker Compose
@@ -79,6 +79,17 @@ major provider. For unattended runs, set `AUTO=1` and export the vars you want
 workstation-driven [`scripts/deploy.sh`](scripts/deploy.sh) (push from your machine
 over SSH) is still available.
 
+**Updating an existing container** — pull the latest proxy code into a running LXC
+and restart the service (run on the PVE host). It syntax-checks the new code before
+bouncing the service and keeps a `.bak` for rollback:
+
+```bash
+bash -c "$(wget -qLO - https://raw.githubusercontent.com/TheStonedGamer/nvidia-failover-lxc/main/scripts/proxmox-lxc.sh)" -- update <CTID>
+```
+
+It auto-detects the install location (`/opt/nvidia-failover` for helper installs,
+`/root/model-router` for the legacy `deploy.sh` layout).
+
 ### Seeding providers from environment variables
 
 Any of the major OpenAI-compatible providers can be pre-configured at first run by
@@ -96,7 +107,7 @@ setting `<PROVIDER>_API_KEY` — no web-UI step needed. Recognized prefixes:
 docker run -d --name nvidia-failover-proxy -p 5002:5002 -v proxy-data:/data \
   -e OPENAI_API_KEY=sk-... -e OPENAI_MODELS="gpt-5,gpt-5-mini" \
   -e GROQ_API_KEY=gsk-... -e GROQ_MODELS="llama-3.3-70b-versatile" \
-  thestonedgamer/nvidia-failover-proxy:latest
+  shinyjesus/nvidia-failover-proxy:latest
 ```
 
 Seeding only fires when a provider isn't already configured, so the web UI remains
@@ -140,9 +151,12 @@ and every `v*` tag. To enable it, add two **repository secrets**
 | `DOCKERHUB_USERNAME` | your Docker Hub username |
 | `DOCKERHUB_TOKEN` | a Docker Hub **access token** (Account Settings → Security → New Access Token) |
 
-The image is published as `<DOCKERHUB_USERNAME>/nvidia-failover-proxy`, tagged
-`latest`, the branch name, the short commit SHA, and semver tags for `v*` releases.
-Pull requests build but do **not** push.
+The image is published as `<DOCKERHUB_USERNAME>/nvidia-failover-proxy` (currently
+[`shinyjesus/nvidia-failover-proxy`](https://hub.docker.com/r/shinyjesus/nvidia-failover-proxy)),
+tagged `latest`, the branch name, the short commit SHA, and semver tags for `v*`
+releases. When the secrets are absent the workflow still builds the image (to prove
+it compiles) but skips the push instead of failing. Pull requests build but do
+**not** push.
 
 ---
 

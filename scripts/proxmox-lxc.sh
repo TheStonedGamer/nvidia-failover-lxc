@@ -66,6 +66,66 @@ header
 command -v pct >/dev/null 2>&1 || die "must be run on a Proxmox VE host (pct not found)"
 [ "$(id -u)" -eq 0 ] || die "must be run as root"
 
+MODE="${1:-install}"
+
+# --- update: pull the latest proxy code into an existing container ----------
+do_update() {
+  local ctid="${2:-${CT_ID:-}}"
+  if [ -z "$ctid" ]; then
+    ask ctid "Container ID to update" ""
+  fi
+  [ -n "$ctid" ] || die "no container ID given (usage: proxmox-lxc.sh update <CTID>)"
+  pct status "$ctid" >/dev/null 2>&1 || die "CT $ctid does not exist"
+  pct start "$ctid" >/dev/null 2>&1 || true
+
+  # Find where the proxy is installed (helper layout, else legacy deploy.sh).
+  local dir=""
+  for cand in /opt/nvidia-failover /root/model-router; do
+    if pct exec "$ctid" -- test -f "$cand/nvidia_failover_proxy.py"; then dir="$cand"; break; fi
+  done
+  [ -n "$dir" ] || die "couldn't find nvidia_failover_proxy.py in CT $ctid (looked in /opt/nvidia-failover, /root/model-router)"
+  msg_info "Updating CT ${BL}$ctid${CL} at ${dir}"
+
+  # Back up the current file, fetch the latest, refresh deps if a venv exists.
+  pct exec "$ctid" -- bash -c "
+    set -e
+    cd '$dir'
+    cp nvidia_failover_proxy.py nvidia_failover_proxy.py.bak 2>/dev/null || true
+    curl -fsSL '${REPO_RAW}/nvidia_failover_proxy.py' -o nvidia_failover_proxy.py
+    curl -fsSL '${REPO_RAW}/requirements.txt' -o requirements.txt 2>/dev/null || true
+    if [ -x .venv/bin/pip ]; then .venv/bin/pip install -q -r requirements.txt || true; fi
+    # Syntax-check before we bounce the service; roll back on failure.
+    PY=.venv/bin/python; [ -x \"\$PY\" ] || PY=python3
+    if ! \$PY -c 'import ast,sys; ast.parse(open(\"nvidia_failover_proxy.py\",encoding=\"utf-8\").read())'; then
+      echo 'SYNTAX_FAIL'; mv -f nvidia_failover_proxy.py.bak nvidia_failover_proxy.py 2>/dev/null || true; exit 1
+    fi
+  " || die "update failed (code fetched did not parse; rolled back)"
+  msg_ok "Code updated"
+
+  # Restart whichever service unit is present.
+  local svc="nvidia-failover-proxy"
+  pct exec "$ctid" -- systemctl list-unit-files 2>/dev/null | grep -q "$svc" || svc="model-router"
+  pct exec "$ctid" -- systemctl restart "$svc" 2>/dev/null \
+    || die "couldn't restart service (tried '$svc') — check: pct exec $ctid -- systemctl status $svc"
+  msg_ok "Service '$svc' restarted"
+
+  sleep 4
+  local ip; ip="$(pct exec "$ctid" -- hostname -I 2>/dev/null | awk '{print $1}')"
+  if pct exec "$ctid" -- curl -fsS --max-time 8 "http://127.0.0.1:${PROXY_PORT}/health" >/dev/null 2>&1; then
+    msg_ok "Health check passed"
+  else
+    msg_error "Health check did not pass — check: pct exec $ctid -- journalctl -u $svc -e"
+  fi
+  echo
+  msg_ok "${APP} updated"
+  echo -e "   Dashboard : ${BL}http://${ip}:${PROXY_PORT}/${CL}"
+  echo -e "   Rollback  : ${YW}pct exec $ctid -- bash -c 'cd $dir && mv -f nvidia_failover_proxy.py.bak nvidia_failover_proxy.py && systemctl restart $svc'${CL}"
+  exit 0
+}
+
+if [ "$MODE" = "update" ]; then do_update "$@"; fi
+if [ "$MODE" != "install" ]; then die "unknown command '$MODE' (use: install | update <CTID>)"; fi
+
 DEFAULT_CTID="$(pvesh get /cluster/nextid 2>/dev/null || echo 3000)"
 DEFAULT_STORAGE="$(pvesm status -content rootdir 2>/dev/null | awk 'NR==2{print $1}')"
 DEFAULT_STORAGE="${DEFAULT_STORAGE:-local-lvm}"

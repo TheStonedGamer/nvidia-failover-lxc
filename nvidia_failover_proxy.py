@@ -38,6 +38,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import sqlite3
 import time
 from typing import Dict, List, Optional, Set
@@ -46,9 +47,27 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
-from src.providers.nvidia import resolve_api_key
-
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
+
+# NVIDIA API key resolution — inlined so this file is fully self-contained (the
+# standalone installers, the Docker image, and the LXC helper all ship just this
+# one module). Env NVIDIA_API_KEY first, else the key already in OpenCode's
+# opencode.jsonc so it lives in exactly one place. A targeted regex beats naive
+# JSONC comment-stripping, which would corrupt "https://..." strings.
+_OPENCODE_JSONC = os.path.expanduser("~/.config/opencode/opencode.jsonc")
+_NVAPI_RE = re.compile(r'"apiKey"\s*:\s*"(nvapi-[A-Za-z0-9_\-]+)"')
+
+
+def resolve_api_key() -> Optional[str]:
+    key = os.environ.get("NVIDIA_API_KEY")
+    if key:
+        return key
+    try:
+        with open(_OPENCODE_JSONC, "r", encoding="utf-8") as f:
+            m = _NVAPI_RE.search(f.read())
+        return m.group(1) if m else None
+    except OSError:
+        return None
 
 # Curated frontier ladder — the top-tier flagship chat/reasoning models on the
 # NVIDIA hosted API, strongest first (verified present 2026-07-06 via /v1/models).
@@ -1591,26 +1610,40 @@ async def post_settings(request: Request):
 
 
 async def _fetch_model_ids(base_url: str, key: Optional[str]) -> dict:
-    """GET {base_url}/models from an OpenAI-compatible endpoint."""
+    """GET {base_url}/models from an OpenAI-compatible endpoint.
+
+    Retries once on a transport/timeout error: hosts like NVIDIA publish several
+    A records, and if the first IP blackholes the SYN httpx can burn the whole
+    connect budget before trying the next — a fresh client on retry picks another
+    address, so a transient ConnectTimeout doesn't fail discovery outright."""
     headers = {"Content-Type": "application/json"}
     if key:
         headers["Authorization"] = f"Bearer {key}"
     url = f"{base_url.rstrip('/')}/models"
-    try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(15.0, connect=5.0)
-        ) as client:
-            r = await client.get(url, headers=headers)
-        if r.status_code >= 400:
-            return {"error": f"HTTP {r.status_code}"}
-        data = r.json()
-        ids = sorted(
-            m.get("id") for m in data.get("data", []) if isinstance(m, dict) and m.get("id")
-        )
-        return {"models": ids}
-    except (httpx.HTTPError, ValueError, KeyError) as e:
-        msg = str(e).strip() or type(e).__name__
-        return {"error": msg[:140]}
+    last: Optional[Exception] = None
+    for attempt in range(2):
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(15.0, connect=10.0)
+            ) as client:
+                r = await client.get(url, headers=headers)
+            if r.status_code >= 400:
+                return {"error": f"HTTP {r.status_code}"}
+            data = r.json()
+            ids = sorted(
+                m.get("id")
+                for m in data.get("data", [])
+                if isinstance(m, dict) and m.get("id")
+            )
+            return {"models": ids}
+        except (httpx.TransportError, httpx.TimeoutException) as e:
+            last = e  # transient — try a fresh connection once more
+            continue
+        except (httpx.HTTPError, ValueError, KeyError) as e:
+            msg = str(e).strip() or type(e).__name__
+            return {"error": msg[:140]}
+    msg = str(last).strip() or type(last).__name__ if last else "unknown error"
+    return {"error": msg[:140]}
 
 
 @app.get("/_models/available")
