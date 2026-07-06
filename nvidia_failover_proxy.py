@@ -72,6 +72,27 @@ FRONTIER_MODELS: List[str] = [
     "meta/llama-3.3-70b-instruct",
 ]
 
+# Env-var seeding for the major OpenAI-compatible providers. On first run (when
+# the provider isn't already configured) the proxy reads <PREFIX>_API_KEY and, if
+# present, adds that provider with its default base_url. Optional companions:
+#   <PREFIX>_MODELS     comma-separated model ids to seed into the failover ladder
+#   <PREFIX>_BASE_URL   override the default endpoint (e.g. a self-hosted gateway)
+# name -> (env prefix, default base_url). NVIDIA also honors the legacy
+# NVIDIA_API_KEY / ROUTER_NVIDIA_MODELS handled by _migrate_nvidia_provider().
+PROVIDER_ENV: Dict[str, str] = {
+    "nvidia": NVIDIA_BASE_URL,
+    "openai": "https://api.openai.com/v1",
+    "anthropic": "https://api.anthropic.com/v1",
+    "cerebras": "https://api.cerebras.ai/v1",
+    "groq": "https://api.groq.com/openai/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "mistral": "https://api.mistral.ai/v1",
+    "deepseek": "https://api.deepseek.com/v1",
+    "google": "https://generativelanguage.googleapis.com/v1beta/openai",
+    "xai": "https://api.x.ai/v1",
+    "together": "https://api.together.xyz/v1",
+}
+
 AUTO_MODEL = "nvidia-auto"  # cloud frontier ladder, then local 80B tail rung
 ONLY_MODEL = "nvidia-only"  # cloud frontier ladder ONLY; 429 when all cooling
 REFINER_MODEL_ID = "nvidia-refine"  # cloud ladder + local Qwen 4b prompt refiner
@@ -214,7 +235,9 @@ class LadderConfig:
                     self.providers = json.loads(kv["providers"])
                 if kv.get("nvidia_key"):
                     self.nvidia_key = kv["nvidia_key"]
-                if self._migrate_nvidia_provider():
+                changed = self._migrate_nvidia_provider()
+                changed = self._seed_providers_from_env() or changed
+                if changed:
                     self._write(conn)
                     conn.commit()
                     _db_secure()
@@ -247,6 +270,38 @@ class LadderConfig:
                 self.order.append(m)
         self.nvidia_key = None  # key now lives on the provider
         return True
+
+    def _seed_providers_from_env(self) -> bool:
+        """Seed any major OpenAI-compatible provider from environment variables.
+        For each entry in PROVIDER_ENV, if <PREFIX>_API_KEY is set and that
+        provider isn't already configured, add it (with optional <PREFIX>_MODELS
+        and <PREFIX>_BASE_URL). Only seeds when absent, so the web UI stays the
+        source of truth once a provider exists. Returns True if anything changed."""
+        changed = False
+        for name, default_url in PROVIDER_ENV.items():
+            if name in self.providers:
+                continue  # user/UI already owns this provider
+            prefix = name.upper()
+            key = (os.environ.get(f"{prefix}_API_KEY") or "").strip()
+            if not key:
+                continue
+            base_url = (os.environ.get(f"{prefix}_BASE_URL") or default_url).strip()
+            raw = os.environ.get(f"{prefix}_MODELS") or ""
+            if not raw and name == "nvidia":
+                raw = os.environ.get("ROUTER_NVIDIA_MODELS") or ""
+            models = [m.strip() for m in raw.split(",") if m.strip()]
+            if name == "nvidia" and not models:
+                models = list(FRONTIER_MODELS)
+            self.providers[name] = {
+                "base_url": base_url,
+                "api_key": key,
+                "models": models,
+            }
+            for m in models:
+                if m not in self.order:
+                    self.order.append(m)
+            changed = True
+        return changed
 
     def _import_json(self) -> None:
         try:

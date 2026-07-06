@@ -62,14 +62,45 @@ PROXY_HOST=0.0.0.0 python nvidia_failover_proxy.py
 # → http://0.0.0.0:5002/v1
 ```
 
-### Proxmox LXC
+### Proxmox VE (helper script)
 
-[`scripts/deploy.sh`](scripts/deploy.sh) creates an unprivileged Ubuntu container on a
-Proxmox host, installs the proxy as a systemd service, and binds it to `0.0.0.0`:
+Run [`scripts/proxmox-lxc.sh`](scripts/proxmox-lxc.sh) **on a Proxmox VE host** (as
+root). It's an interactive helper — it creates an unprivileged Debian LXC, installs
+the proxy as a systemd service bound to `0.0.0.0`, and optionally seeds any provider
+API keys — with sensible defaults (next free CTID, DHCP, 2 core / 2 GB / 6 GB):
 
 ```bash
-./scripts/deploy.sh <pve-host-ip> <container-ip> <local-ollama-ip> 'nvapi-YOUR-KEY'
+bash -c "$(wget -qLO - https://raw.githubusercontent.com/TheStonedGamer/nvidia-failover-lxc/main/scripts/proxmox-lxc.sh)"
 ```
+
+It prompts (via whiptail) for container specs and, optionally, an API key for each
+major provider. For unattended runs, set `AUTO=1` and export the vars you want
+(`CT_ID`, `CT_NET`, `CT_STORAGE`, `NVIDIA_API_KEY`, `OPENAI_API_KEY`, …). The older
+workstation-driven [`scripts/deploy.sh`](scripts/deploy.sh) (push from your machine
+over SSH) is still available.
+
+### Seeding providers from environment variables
+
+Any of the major OpenAI-compatible providers can be pre-configured at first run by
+setting `<PROVIDER>_API_KEY` — no web-UI step needed. Recognized prefixes:
+`NVIDIA`, `OPENAI`, `ANTHROPIC`, `CEREBRAS`, `GROQ`, `OPENROUTER`, `MISTRAL`,
+`DEEPSEEK`, `GOOGLE`, `XAI`, `TOGETHER`. Optional companions per provider:
+
+| Variable | Purpose |
+| --- | --- |
+| `<PREFIX>_API_KEY` | seeds that provider on first run (if not already configured) |
+| `<PREFIX>_MODELS` | comma-separated model ids to add to the failover ladder |
+| `<PREFIX>_BASE_URL` | override the default endpoint (e.g. a self-hosted gateway) |
+
+```bash
+docker run -d --name nvidia-failover-proxy -p 5002:5002 -v proxy-data:/data \
+  -e OPENAI_API_KEY=sk-... -e OPENAI_MODELS="gpt-5,gpt-5-mini" \
+  -e GROQ_API_KEY=gsk-... -e GROQ_MODELS="llama-3.3-70b-versatile" \
+  thestonedgamer/nvidia-failover-proxy:latest
+```
+
+Seeding only fires when a provider isn't already configured, so the web UI remains
+the source of truth once you've added or edited it there.
 
 ### Standalone installers (no Python required)
 
@@ -169,8 +200,9 @@ variables set defaults and infrastructure:
 | `PROXY_HOST` | `127.0.0.1` | bind address (Docker sets `0.0.0.0`) |
 | `PROXY_PORT` | `5002` | listen port |
 | `PROXY_DB_FILE` | `./proxy.db` (`/data/proxy.db` in Docker) | SQLite store for config + stats |
-| `NVIDIA_API_KEY` | — | seeds a first-run `nvidia` provider (optional) |
-| `ROUTER_NVIDIA_MODELS` | built-in frontier list | comma-separated NVIDIA model ids used to seed migration |
+| `<PREFIX>_API_KEY` | — | seed any major provider on first run — see [Seeding providers from environment variables](#seeding-providers-from-environment-variables) (`NVIDIA`, `OPENAI`, `ANTHROPIC`, `GROQ`, …) |
+| `<PREFIX>_MODELS` / `<PREFIX>_BASE_URL` | — | model ids / endpoint override for a seeded provider |
+| `ROUTER_NVIDIA_MODELS` | built-in frontier list | comma-separated NVIDIA model ids (alias for `NVIDIA_MODELS`) |
 | `LOCAL_OLLAMA_URL` | `http://10.0.0.142:11434/v1` | local Ollama base URL for the tail rung |
 | `LOCAL_MODEL` | `Qwen3-Coder-Next-80b-A3B:latest` | local model id |
 | `PROXY_LOCAL_FALLBACK` | `1` | set `0` to disable the local tail rung |
