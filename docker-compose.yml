@@ -1,0 +1,23 @@
+services:
+  nvidia-failover-proxy:
+    # Pull the published image…
+    image: ${DOCKERHUB_USERNAME:-thestonedgamer}/nvidia-failover-proxy:latest
+    # …or build locally instead by uncommenting:
+    # build: .
+    container_name: nvidia-failover-proxy
+    restart: unless-stopped
+    ports:
+      - "5002:5002"
+    environment:
+      # Optional: seeds a first-run "nvidia" provider with this key. You can also
+      # add NVIDIA (and OpenAI/Anthropic/Cerebras/…) entirely from the web UI.
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY:-}
+      # Optional local Ollama tail rung:
+      # LOCAL_OLLAMA_URL: http://host.docker.internal:11434/v1
+      # PROXY_LOCAL_FALLBACK: "0"
+    volumes:
+      # Persists proxy.db (provider config, API keys, learned rate limits).
+      - proxy-data:/data
+
+volumes:
+  proxy-data:

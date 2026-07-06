@@ -1,0 +1,13 @@
+.git
+.github
+scripts
+*.md
+__pycache__
+**/__pycache__
+*.pyc
+proxy.db
+proxy.db-wal
+proxy.db-shm
+proxy_config.json
+proxy_stats.json
+.venv
