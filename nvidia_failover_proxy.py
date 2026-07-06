@@ -202,6 +202,7 @@ class LadderConfig:
                     self._import_json()
                     self._write(conn)
                     conn.commit()
+                    _db_secure()
                     kv = _kv_get_all(conn)
                 if "order" in kv:
                     self.order = json.loads(kv["order"])
@@ -641,6 +642,7 @@ class Stats:
                 conn.commit()
             finally:
                 conn.close()
+            _db_secure()
         except sqlite3.Error:
             pass
 
