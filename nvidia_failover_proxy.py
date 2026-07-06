@@ -38,6 +38,7 @@ import asyncio
 import base64
 import json
 import os
+import sqlite3
 import time
 from typing import Dict, List, Optional, Set
 
@@ -131,6 +132,42 @@ def _ladder() -> List[str]:
     return list(FRONTIER_MODELS)
 
 
+# --- SQLite persistence -------------------------------------------------------------
+# One DB holds both the config (order/toggles/providers/keys) and the learned
+# per-model stats. Legacy JSON files are auto-imported once on first run.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+DB_FILE = os.environ.get("PROXY_DB_FILE", os.path.join(_HERE, "proxy.db"))
+
+
+def _db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_FILE, timeout=5.0)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS stats (model TEXT PRIMARY KEY, data TEXT)")
+    return conn
+
+
+def _db_secure() -> None:
+    """DB holds API keys — keep it (and WAL sidecars) owner-only."""
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            os.chmod(DB_FILE + suffix, 0o600)
+        except OSError:
+            pass
+
+
+def _kv_get_all(conn: sqlite3.Connection) -> Dict[str, str]:
+    return {k: v for k, v in conn.execute("SELECT key, value FROM kv")}
+
+
+def _kv_set(conn: sqlite3.Connection, mapping: Dict[str, str]) -> None:
+    conn.executemany(
+        "INSERT INTO kv(key, value) VALUES(?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        list(mapping.items()),
+    )
+
+
 # --- Ladder config (user-reorderable + toggleable via web UI) -----------------------
 CONFIG_FILE = os.environ.get("PROXY_CONFIG_FILE", "proxy_config.json")
 
@@ -157,38 +194,64 @@ class LadderConfig:
 
     def load(self) -> None:
         try:
-            if os.path.exists(CONFIG_FILE):
-                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data.get("order"), list):
-                    self.order = data["order"]
-                if isinstance(data.get("disabled"), list):
-                    self.disabled = set(data["disabled"])
-                if isinstance(data.get("providers"), dict):
-                    self.providers = data["providers"]
-                if isinstance(data.get("nvidia_key"), str) and data["nvidia_key"]:
-                    self.nvidia_key = data["nvidia_key"]
+            conn = _db()
+            try:
+                kv = _kv_get_all(conn)
+                if not kv and os.path.exists(CONFIG_FILE):
+                    # One-time migration from the legacy JSON config.
+                    self._import_json()
+                    self._write(conn)
+                    conn.commit()
+                    kv = _kv_get_all(conn)
+                if "order" in kv:
+                    self.order = json.loads(kv["order"])
+                if "disabled" in kv:
+                    self.disabled = set(json.loads(kv["disabled"]))
+                if "providers" in kv:
+                    self.providers = json.loads(kv["providers"])
+                if kv.get("nvidia_key"):
+                    self.nvidia_key = kv["nvidia_key"]
+            finally:
+                conn.close()
+        except (sqlite3.Error, json.JSONDecodeError, OSError):
+            pass
+
+    def _import_json(self) -> None:
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data.get("order"), list):
+                self.order = data["order"]
+            if isinstance(data.get("disabled"), list):
+                self.disabled = set(data["disabled"])
+            if isinstance(data.get("providers"), dict):
+                self.providers = data["providers"]
+            if isinstance(data.get("nvidia_key"), str) and data["nvidia_key"]:
+                self.nvidia_key = data["nvidia_key"]
         except (OSError, json.JSONDecodeError):
             pass
 
+    def _write(self, conn: sqlite3.Connection) -> None:
+        _kv_set(
+            conn,
+            {
+                "order": json.dumps(self.order),
+                "disabled": json.dumps(list(self.disabled)),
+                "providers": json.dumps(self.providers),
+                "nvidia_key": self.nvidia_key or "",
+            },
+        )
+
     def save(self) -> None:
-        tmp = f"{CONFIG_FILE}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "order": self.order,
-                    "disabled": list(self.disabled),
-                    "providers": self.providers,
-                    "nvidia_key": self.nvidia_key,
-                },
-                f,
-                indent=2,
-            )
-        os.replace(tmp, CONFIG_FILE)
-        # Config holds API keys in plaintext — keep it owner-only.
         try:
-            os.chmod(CONFIG_FILE, 0o600)
-        except OSError:
+            conn = _db()
+            try:
+                self._write(conn)
+                conn.commit()
+            finally:
+                conn.close()
+            _db_secure()
+        except sqlite3.Error:
             pass
 
     def update(
@@ -568,18 +631,43 @@ class Stats:
     def _save(self) -> None:
         self._last_save = time.time()
         try:
-            with open(STATS_PATH, "w", encoding="utf-8") as f:
-                json.dump(self.models, f, indent=2)
-        except OSError:
+            conn = _db()
+            try:
+                conn.executemany(
+                    "INSERT INTO stats(model, data) VALUES(?, ?) "
+                    "ON CONFLICT(model) DO UPDATE SET data=excluded.data",
+                    [(m, json.dumps(d)) for m, d in self.models.items()],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except sqlite3.Error:
             pass
 
     @classmethod
     def load(cls) -> "Stats":
         try:
-            with open(STATS_PATH, "r", encoding="utf-8") as f:
-                return cls(json.load(f))
-        except (OSError, ValueError):
+            conn = _db()
+            try:
+                rows = list(conn.execute("SELECT model, data FROM stats"))
+                if not rows and os.path.exists(STATS_PATH):
+                    # One-time migration from the legacy JSON stats file.
+                    inst = cls(_load_json_stats())
+                    inst._save()
+                    return inst
+                return cls({m: json.loads(d) for m, d in rows})
+            finally:
+                conn.close()
+        except (sqlite3.Error, ValueError):
             return cls()
+
+
+def _load_json_stats() -> dict:
+    try:
+        with open(STATS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
 
 
 cascade = Cascade()
@@ -865,7 +953,7 @@ async def stats_json() -> dict:
     return {
         "models": _model_view(),
         "window_s": int(_RPM_WINDOW_S),
-        "stats_file": STATS_PATH,
+        "db_file": DB_FILE,
     }
 
 
