@@ -722,13 +722,17 @@ def _model_view() -> List[dict]:
     """Per-model snapshot joining live cascade state with learned stats."""
     now = time.time()
     rows: List[dict] = []
-    names = list(cascade.models) + ([cascade.local] if cascade.local else [])
+    # Follow the user-defined failover order from the web UI so the metrics table
+    # matches the config panel; local tail rung stays last.
+    names = _known_models() + ([cascade.local] if cascade.local else [])
     for name in names:
         m = stats.models.get(name, {})
         until = cascade.model_until.get(name, 0.0)
         cooling = max(0, int(until - now)) if until > now else 0
         if cascade.is_local(name):
             state = "local"
+        elif not ladder_config.is_enabled(name):
+            state = "disabled"
         elif name in cascade.dead:
             state = "dead"
         elif cooling:
@@ -805,6 +809,7 @@ async def _live_tbody() -> str:
         "cooling": "#e65100",
         "dead": "#b71c1c",
         "local": "#1565c0",
+        "disabled": "#5b6472",
     }
     tot = {
         "requests": 0,
@@ -824,7 +829,11 @@ async def _live_tbody() -> str:
             else (
                 _fmt_dur(r["cooling_s"])
                 if r["state"] == "cooling"
-                else ("last rung" if r["state"] == "local" else "dropped")
+                else (
+                    "last rung"
+                    if r["state"] == "local"
+                    else ("off" if r["state"] == "disabled" else "dropped")
+                )
             )
         )
         limit_rpm = (
@@ -1026,6 +1035,7 @@ async def dashboard() -> str:
         "cooling": "#e65100",
         "dead": "#b71c1c",
         "local": "#1565c0",
+        "disabled": "#5b6472",
     }
     tot = {
         "requests": 0,
@@ -1045,7 +1055,11 @@ async def dashboard() -> str:
             else (
                 _fmt_dur(r["cooling_s"])
                 if r["state"] == "cooling"
-                else ("last rung" if r["state"] == "local" else "dropped")
+                else (
+                    "last rung"
+                    if r["state"] == "local"
+                    else ("off" if r["state"] == "disabled" else "dropped")
+                )
             )
         )
         limit_rpm = (
@@ -1169,7 +1183,7 @@ src.onerror=function(){{
 <h1>{_NV_LOGO_SVG}<span><span class=nvbrand>NVIDIA</span> failover proxy — live state <span class=connection style="font-size:10px">connecting...</span></span></h1>
 <div class=sub>key {"<span class=ok>loaded</span>" if key_ok else "<span class=bad>missing</span>"}
  · live updates via SSE · models: auto, only, refine (+local refiner), local-only, local-refine, agent-*<span id=timer style="margin-left:10px;color:#5b6472">0s</span></div>
-<details id=cfgpanel open><summary>&#9881; Failover ladder — drag to reorder, uncheck to disable</summary>
+<details id=cfgpanel><summary>&#9881; Failover ladder — drag to reorder, uncheck to disable</summary>
 <ul id=cfglist>{cfg_html}</ul>
 <div class=cfgbar><button id=cfgsave>Save order &amp; toggles</button><button id=cfgreset>Reload</button><span id=cfgstatus class=dim></span></div>
 </details>
