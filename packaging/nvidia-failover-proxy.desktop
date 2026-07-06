@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=NVIDIA Failover Proxy
+Comment=OpenAI-compatible multi-provider failover proxy
+Exec=nvidia-failover-proxy
+Icon=nvidia-failover-proxy
+Categories=Development;Utility;
+Terminal=true

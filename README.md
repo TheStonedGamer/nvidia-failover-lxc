@@ -71,6 +71,29 @@ Proxmox host, installs the proxy as a systemd service, and binds it to `0.0.0.0`
 ./scripts/deploy.sh <pve-host-ip> <container-ip> <local-ollama-ip> 'nvapi-YOUR-KEY'
 ```
 
+### Standalone installers (no Python required)
+
+Prebuilt, self-contained builds are produced by GitHub Actions for every `v*`
+release ([`.github/workflows/build-installers.yml`](.github/workflows/build-installers.yml))
+and attached to the [Releases](../../releases) page:
+
+| Platform | Download | Notes |
+| --- | --- | --- |
+| **Windows** | `nvidia-failover-proxy-setup-windows-x64.exe` (installer) or the bare `…-windows-x64.exe` | Inno Setup installer with Start-menu shortcuts; the bare exe is portable |
+| **macOS (Intel)** | `nvidia-failover-proxy-macos-x64.dmg` | unsigned — first launch: right-click → Open, or `xattr -dr com.apple.quarantine` the binary |
+| **macOS (Apple Silicon)** | `nvidia-failover-proxy-macos-arm64.dmg` | same as above |
+| **Linux** | `nvidia-failover-proxy-linux-x64.AppImage` | `chmod +x` then run; bundles its own Python |
+
+Each is a single executable that starts the proxy on `http://localhost:5002/`.
+The SQLite store (`proxy.db`) is written next to the executable unless you set
+`PROXY_DB_FILE`. To build them yourself locally:
+
+```bash
+pip install -r requirements.txt pyinstaller
+pyinstaller --onefile --name nvidia-failover-proxy --collect-submodules uvicorn nvidia_failover_proxy.py
+# → dist/nvidia-failover-proxy
+```
+
 ---
 
 ## Publishing the Docker image (CI)

@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+dist/
+build/
+installer/
+out/
+*.spec
+AppDir/
+proxy.db
+proxy.db-*
