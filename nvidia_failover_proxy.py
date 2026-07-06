@@ -136,15 +136,23 @@ CONFIG_FILE = os.environ.get("PROXY_CONFIG_FILE", "proxy_config.json")
 
 
 class LadderConfig:
-    """Persists user-defined failover order + disabled models to proxy_config.json.
+    """Persists user-defined failover order, disabled models, custom
+    OpenAI-compatible providers, and API-key overrides to proxy_config.json.
 
-    The web UI calls /_config GET to read and /_config POST to update.
-    Cascade.order() consults this to reorder / skip models.
+    The web UI calls /_config (order/toggles), /_settings (providers + keys),
+    and /_models/available (discovery). Cascade.order() consults active_ladder()
+    and _route() consults model_provider() for per-model base_url/key.
+
+    Each custom provider: {name, base_url, api_key, models: [ids...]}. Its model
+    ids route to that provider's base_url + key instead of NVIDIA.
     """
 
     def __init__(self) -> None:
         self.order: List[str] = _ladder()
         self.disabled: Set[str] = set()
+        # name -> {"base_url": str, "api_key": str, "models": [str, ...]}
+        self.providers: Dict[str, dict] = {}
+        self.nvidia_key: Optional[str] = None  # overrides env / opencode.jsonc
         self.load()
 
     def load(self) -> None:
@@ -156,6 +164,10 @@ class LadderConfig:
                     self.order = data["order"]
                 if isinstance(data.get("disabled"), list):
                     self.disabled = set(data["disabled"])
+                if isinstance(data.get("providers"), dict):
+                    self.providers = data["providers"]
+                if isinstance(data.get("nvidia_key"), str) and data["nvidia_key"]:
+                    self.nvidia_key = data["nvidia_key"]
         except (OSError, json.JSONDecodeError):
             pass
 
@@ -163,9 +175,21 @@ class LadderConfig:
         tmp = f"{CONFIG_FILE}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(
-                {"order": self.order, "disabled": list(self.disabled)}, f, indent=2
+                {
+                    "order": self.order,
+                    "disabled": list(self.disabled),
+                    "providers": self.providers,
+                    "nvidia_key": self.nvidia_key,
+                },
+                f,
+                indent=2,
             )
         os.replace(tmp, CONFIG_FILE)
+        # Config holds API keys in plaintext — keep it owner-only.
+        try:
+            os.chmod(CONFIG_FILE, 0o600)
+        except OSError:
+            pass
 
     def update(
         self, order: Optional[List[str]] = None, disabled: Optional[List[str]] = None
@@ -182,6 +206,52 @@ class LadderConfig:
     def active_ladder(self) -> List[str]:
         """Return models in user-defined order, excluding disabled ones."""
         return [m for m in self.order if m not in self.disabled]
+
+    # --- custom providers + keys ------------------------------------------
+    def custom_models(self) -> List[str]:
+        out: List[str] = []
+        for p in self.providers.values():
+            out.extend(m for m in p.get("models", []) if m not in out)
+        return out
+
+    def model_provider(self, model: str) -> Optional[tuple]:
+        """(base_url, api_key) for a custom-provider model, else None (=NVIDIA)."""
+        for p in self.providers.values():
+            if model in p.get("models", []):
+                return p.get("base_url", "").rstrip("/"), p.get("api_key") or None
+        return None
+
+    def set_nvidia_key(self, key: Optional[str]) -> None:
+        self.nvidia_key = key.strip() if key and key.strip() else None
+        self.save()
+
+    def add_provider(
+        self, name: str, base_url: str, api_key: str, models: List[str]
+    ) -> None:
+        name = name.strip()
+        base_url = base_url.strip()
+        models = [m.strip() for m in models if m.strip()]
+        self.providers[name] = {
+            "base_url": base_url,
+            "api_key": (api_key or "").strip(),
+            "models": models,
+        }
+        # Append new models to the failover order so they join the cascade.
+        for m in models:
+            if m not in self.order:
+                self.order.append(m)
+        self.save()
+
+    def remove_provider(self, name: str) -> None:
+        p = self.providers.pop(name, None)
+        if p:
+            gone = set(p.get("models", []))
+            self.order = [m for m in self.order if m not in gone]
+            self.disabled -= gone
+        self.save()
+
+    def resolved_nvidia_key(self) -> Optional[str]:
+        return self.nvidia_key or resolve_api_key()
 
 
 ladder_config = LadderConfig()
@@ -518,14 +588,22 @@ app = FastAPI(title="nvidia-failover-proxy")
 
 
 def _headers() -> Dict[str, str]:
-    key = resolve_api_key()
+    key = ladder_config.resolved_nvidia_key()
     return {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
 
 
 def _route(model: str) -> tuple:
-    """(base_url, headers) for a model — local Ollama needs no auth."""
+    """(base_url, headers) for a model — local Ollama needs no auth, custom
+    providers use their own base_url + key, everything else goes to NVIDIA."""
     if cascade.is_local(model):
         return LOCAL_BASE_URL, {"Content-Type": "application/json"}
+    prov = ladder_config.model_provider(model)
+    if prov:
+        base_url, key = prov
+        headers = {"Content-Type": "application/json"}
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        return base_url, headers
     return NVIDIA_BASE_URL, _headers()
 
 
@@ -723,16 +801,16 @@ def _model_view() -> List[dict]:
     now = time.time()
     rows: List[dict] = []
     # Follow the user-defined failover order from the web UI so the metrics table
-    # matches the config panel; local tail rung stays last.
-    names = _known_models() + ([cascade.local] if cascade.local else [])
+    # matches the config panel; disabled models are hidden; local tail stays last.
+    names = [m for m in _known_models() if ladder_config.is_enabled(m)] + (
+        [cascade.local] if cascade.local else []
+    )
     for name in names:
         m = stats.models.get(name, {})
         until = cascade.model_until.get(name, 0.0)
         cooling = max(0, int(until - now)) if until > now else 0
         if cascade.is_local(name):
             state = "local"
-        elif not ladder_config.is_enabled(name):
-            state = "disabled"
         elif name in cascade.dead:
             state = "dead"
         elif cooling:
@@ -975,11 +1053,112 @@ CFG_SCRIPT = """<script>
 </script>"""
 
 
+SET_SCRIPT = """<script>
+(function(){
+  var st=document.getElementById("setstatus");
+  function esc(s){ return String(s).replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}[c];}); }
+  function say(m){ if(st) st.textContent=m; }
+
+  function addLadderRow(model){
+    var list=document.getElementById("cfglist");
+    if(!list) return false;
+    var have=[].slice.call(list.querySelectorAll(".cfgrow")).some(function(r){return r.getAttribute("data-model")===model;});
+    if(have) return false;
+    var li=document.createElement("li");
+    li.className="cfgrow"; li.setAttribute("draggable","true"); li.setAttribute("data-model",model);
+    li.innerHTML='<span class="grip">&#8942;&#8942;</span><input type="checkbox" class="tog" checked><span class="cfgname">'+esc(model)+'</span>';
+    list.appendChild(li);
+    return true;
+  }
+
+  function renderSettings(d){
+    var ks=document.getElementById("nvkeystat");
+    if(ks) ks.textContent = d.nvidia_key_set ? ("set ("+d.nvidia_key_source+")") : "not set";
+    var ul=document.getElementById("provlist");
+    if(ul){
+      ul.innerHTML="";
+      if(!d.providers.length){ ul.innerHTML='<li class="pvmeta">no custom providers yet</li>'; }
+      d.providers.forEach(function(p){
+        var li=document.createElement("li");
+        li.innerHTML='<b>'+esc(p.name)+'</b> <span class="pvmeta">'+esc(p.base_url)+' · key '+(p.key_masked?esc(p.key_masked):"none")+' · '+p.models.length+' model(s)</span>';
+        var b=document.createElement("button"); b.className="rm"; b.textContent="remove";
+        b.addEventListener("click",function(){ post({action:"remove_provider",name:p.name}); });
+        li.appendChild(b); ul.appendChild(li);
+      });
+    }
+  }
+
+  function load(){ fetch("/_settings").then(function(r){return r.json();}).then(renderSettings).catch(function(){}); }
+  function post(payload){
+    say("saving…");
+    return fetch("/_settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)})
+      .then(function(r){return r.json();})
+      .then(function(d){ if(d.error){say("error: "+d.error);} else {say("saved"); renderSettings(d);} return d; })
+      .catch(function(){ say("request failed"); });
+  }
+
+  var nk=document.getElementById("nvkeysave");
+  if(nk) nk.addEventListener("click",function(){
+    var v=document.getElementById("nvkey").value;
+    post({action:"set_nvidia_key",key:v}).then(function(){document.getElementById("nvkey").value="";});
+  });
+
+  var pa=document.getElementById("pvadd");
+  if(pa) pa.addEventListener("click",function(){
+    var name=document.getElementById("pvname").value.trim();
+    var url=document.getElementById("pvurl").value.trim();
+    var key=document.getElementById("pvkey").value;
+    var models=document.getElementById("pvmodels").value;
+    if(!name||!url){ say("name and base URL required"); return; }
+    post({action:"add_provider",name:name,base_url:url,api_key:key,models:models}).then(function(d){
+      if(d&&!d.error){
+        (models.split(",")).forEach(function(m){ m=m.trim(); if(m) addLadderRow(m); });
+        say("provider added — models appended to ladder");
+        document.getElementById("pvname").value=""; document.getElementById("pvurl").value="";
+        document.getElementById("pvkey").value=""; document.getElementById("pvmodels").value="";
+      }
+    });
+  });
+
+  var db=document.getElementById("discbtn");
+  if(db) db.addEventListener("click",function(){
+    var box=document.getElementById("discresult");
+    box.textContent="querying providers…";
+    fetch("/_models/available").then(function(r){return r.json();}).then(function(d){
+      var have={}; (d.in_ladder||[]).forEach(function(m){have[m]=1;});
+      box.innerHTML="";
+      function section(title,res){
+        var h=document.createElement("div"); h.className="setlbl"; h.style.marginTop="10px";
+        h.textContent=title+(res.error?(" — error: "+res.error):(" ("+(res.models||[]).length+")"));
+        box.appendChild(h);
+        (res.models||[]).forEach(function(m){
+          var chip=document.createElement("span"); chip.className="mdlchip"+(have[m]?" have":"");
+          chip.appendChild(document.createTextNode(m));
+          if(!have[m]){
+            var add=document.createElement("button"); add.textContent="＋";
+            add.addEventListener("click",function(){ if(addLadderRow(m)){ chip.className="mdlchip have"; add.remove(); say("added "+m+" — hit \\"Save order & toggles\\""); } });
+            chip.appendChild(add);
+          }
+          box.appendChild(chip);
+        });
+      }
+      section("NVIDIA", d.nvidia||{});
+      var pv=d.providers||{};
+      Object.keys(pv).forEach(function(name){ section(name, pv[name]); });
+      if(!(d.nvidia&&d.nvidia.models&&d.nvidia.models.length)&&!Object.keys(pv).length) box.appendChild(document.createTextNode("no models discovered"));
+    }).catch(function(){ box.textContent="discovery failed"; });
+  });
+
+  load();
+})();
+</script>"""
+
+
 def _known_models() -> List[str]:
     """Saved user order, with any newly-added built-in ladder models appended
     so the config UI always shows every available cloud model."""
     known = list(ladder_config.order)
-    for m in _ladder():
+    for m in list(_ladder()) + ladder_config.custom_models():
         if m not in known:
             known.append(m)
     return known
@@ -1023,6 +1202,110 @@ async def post_config(request: Request):
             "disabled": sorted(ladder_config.disabled),
             "active": ladder_config.active_ladder(),
         }
+    )
+
+
+def _mask_key(key: Optional[str]) -> str:
+    if not key:
+        return ""
+    return (key[:6] + "…" + key[-4:]) if len(key) > 12 else "•" * len(key)
+
+
+def _settings_view() -> dict:
+    """Providers + key status for the UI — never returns raw keys."""
+    return {
+        "nvidia_key_set": bool(ladder_config.resolved_nvidia_key()),
+        "nvidia_key_source": (
+            "override"
+            if ladder_config.nvidia_key
+            else ("env/opencode" if resolve_api_key() else "none")
+        ),
+        "providers": [
+            {
+                "name": name,
+                "base_url": p.get("base_url", ""),
+                "models": p.get("models", []),
+                "key_masked": _mask_key(p.get("api_key")),
+            }
+            for name, p in ladder_config.providers.items()
+        ],
+    }
+
+
+@app.get("/_settings")
+async def get_settings():
+    return JSONResponse(_settings_view())
+
+
+@app.post("/_settings")
+async def post_settings(request: Request):
+    """Manage the NVIDIA key override and custom OpenAI-compatible providers.
+
+    Body: {"action": "set_nvidia_key"|"add_provider"|"remove_provider", ...}."""
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    action = body.get("action")
+    if action == "set_nvidia_key":
+        ladder_config.set_nvidia_key(body.get("key"))
+    elif action == "add_provider":
+        name = (body.get("name") or "").strip()
+        base_url = (body.get("base_url") or "").strip()
+        models = body.get("models") or []
+        if isinstance(models, str):
+            models = [m.strip() for m in models.replace("\n", ",").split(",")]
+        if not name or not base_url:
+            return JSONResponse(
+                {"error": "name and base_url are required"}, status_code=400
+            )
+        if not isinstance(models, list):
+            return JSONResponse({"error": "models must be a list"}, status_code=400)
+        ladder_config.add_provider(name, base_url, body.get("api_key") or "", models)
+    elif action == "remove_provider":
+        ladder_config.remove_provider((body.get("name") or "").strip())
+    else:
+        return JSONResponse({"error": f"unknown action {action!r}"}, status_code=400)
+    return JSONResponse({"ok": True, **_settings_view()})
+
+
+async def _fetch_model_ids(base_url: str, key: Optional[str]) -> dict:
+    """GET {base_url}/models from an OpenAI-compatible endpoint."""
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    url = f"{base_url.rstrip('/')}/models"
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(15.0, connect=5.0)
+        ) as client:
+            r = await client.get(url, headers=headers)
+        if r.status_code >= 400:
+            return {"error": f"HTTP {r.status_code}"}
+        data = r.json()
+        ids = sorted(
+            m.get("id") for m in data.get("data", []) if isinstance(m, dict) and m.get("id")
+        )
+        return {"models": ids}
+    except (httpx.HTTPError, ValueError, KeyError) as e:
+        return {"error": str(e)[:140]}
+
+
+@app.get("/_models/available")
+async def models_available():
+    """Live-discover model ids from NVIDIA + each custom provider so the UI can
+    offer new models to add to the ladder."""
+    in_ladder = set(_known_models())
+    nvidia = await _fetch_model_ids(
+        NVIDIA_BASE_URL, ladder_config.resolved_nvidia_key()
+    )
+    providers = {}
+    for name, p in ladder_config.providers.items():
+        providers[name] = await _fetch_model_ids(
+            p.get("base_url", ""), p.get("api_key")
+        )
+    return JSONResponse(
+        {"in_ladder": sorted(in_ladder), "nvidia": nvidia, "providers": providers}
     )
 
 
@@ -1144,6 +1427,22 @@ li.cfgrow input.tog:not(:checked) ~ .cfgname{{color:#5b6472;text-decoration:line
 .cfgbar{{display:flex;align-items:center;gap:12px;padding:6px 0 4px}}
 .cfgbar button{{background:#1565c0;color:#fff;border:0;border-radius:6px;padding:6px 14px;font:13px system-ui;cursor:pointer}}
 .cfgbar button#cfgreset{{background:#2a2f3a}}
+details#setpanel{{max-width:1280px;margin:0 0 18px;background:#141822;border:1px solid #232733;border-radius:8px;padding:6px 12px}}
+details#setpanel summary{{cursor:pointer;color:#c8cfda;font-weight:600;font-size:13px;padding:6px 0}}
+.setsec{{margin:12px 0;padding-bottom:12px;border-bottom:1px solid #232733}}
+.setlbl{{color:#8b95a5;font-size:12px;text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px}}
+.setrow{{display:flex;gap:8px;flex-wrap:wrap}}
+.setgrid{{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}}
+#setpanel input{{background:#0f1115;border:1px solid #2a2f3a;border-radius:6px;color:#e6e6e6;padding:7px 10px;font:13px system-ui;min-width:180px;flex:1 1 180px}}
+#setpanel button{{background:#1565c0;color:#fff;border:0;border-radius:6px;padding:7px 14px;font:13px system-ui;cursor:pointer;flex:0 0 auto}}
+#setpanel button.small{{background:#2a2f3a;padding:3px 10px;font-size:12px;margin-left:8px}}
+#setpanel button.rm{{background:#7a1f1f}}
+ul#provlist{{list-style:none;margin:0 0 8px;padding:0}}
+ul#provlist li{{display:flex;align-items:center;gap:10px;padding:6px 10px;margin:4px 0;background:#0f1115;border:1px solid #232733;border-radius:6px;font-size:13px}}
+ul#provlist li .pvmeta{{color:#8b95a5;font-size:12px}}
+.mdlchip{{display:inline-block;background:#0f1115;border:1px solid #2a2f3a;border-radius:12px;padding:2px 8px 2px 10px;margin:3px;font-family:ui-monospace,Consolas,monospace;font-size:12px}}
+.mdlchip button{{background:#1b5e20;padding:1px 7px;font-size:11px;margin-left:6px;border-radius:10px}}
+.mdlchip.have{{opacity:.5}}
 </style>
 <script>
 (function(){{
@@ -1187,6 +1486,16 @@ src.onerror=function(){{
 <ul id=cfglist>{cfg_html}</ul>
 <div class=cfgbar><button id=cfgsave>Save order &amp; toggles</button><button id=cfgreset>Reload</button><span id=cfgstatus class=dim></span></div>
 </details>
+<details id=setpanel><summary>&#128273; Providers &amp; API keys — add custom OpenAI-compatible APIs, discover models</summary>
+<div class=setsec><div class=setlbl>NVIDIA API key <span id=nvkeystat class=dim></span></div>
+<div class=setrow><input id=nvkey type=password placeholder="nvapi-… (blank = keep env / opencode.jsonc)"><button id=nvkeysave>Set key</button></div></div>
+<div class=setsec><div class=setlbl>Custom providers</div>
+<ul id=provlist></ul>
+<div class=setgrid><input id=pvname placeholder="name (e.g. openrouter)"><input id=pvurl placeholder="base URL (…/v1)"><input id=pvkey type=password placeholder="API key (optional)"><input id=pvmodels placeholder="model ids, comma-separated"><button id=pvadd>Add provider</button></div></div>
+<div class=setsec style="border-bottom:0"><div class=setlbl>Discover available models <button id=discbtn class=small>Refresh</button></div>
+<div id=discresult class=dim>Click Refresh to query each provider's /v1/models. Green ＋ adds a model to the ladder.</div></div>
+<span id=setstatus class=dim></span>
+</details>
 <table><thead><tr>
 <th>#</th><th>model</th><th>state</th><th>available</th><th>req</th><th>ok</th>
 <th>429s</th><th>rpm now</th><th>learned RPM</th><th>learned TPM in</th><th>learned TPM out</th>
@@ -1194,7 +1503,7 @@ src.onerror=function(){{
 <th class=num>tokens in</th><th class=num>tokens out</th><th class=num>tokens total</th>
 </tr></thead><tbody>{"".join(trs)}</tbody><tfoot>{foot}</tfoot></table>
 </body></html>"""
-    return html.replace("</body>", CFG_SCRIPT + "</body>")
+    return html.replace("</body>", CFG_SCRIPT + SET_SCRIPT + "</body>")
 
 
 @app.get("/v1/models")
