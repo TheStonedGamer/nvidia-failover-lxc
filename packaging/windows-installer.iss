@@ -8,6 +8,9 @@
 #endif
 
 [Setup]
+; Inno resolves relative paths from the script's own dir; anchor them at the
+; repo root (packaging\..) so dist\, installer\ and packaging\ all resolve.
+SourceDir=..
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher=TheStonedGamer
