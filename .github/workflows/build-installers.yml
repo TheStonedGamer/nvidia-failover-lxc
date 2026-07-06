@@ -32,10 +32,6 @@ jobs:
         include:
           - os: windows-latest
             target: windows-x64
-          - os: macos-13
-            target: macos-x64
-          - os: macos-latest
-            target: macos-arm64
           - os: ubuntu-latest
             target: linux-x64
     runs-on: ${{ matrix.os }}
@@ -71,14 +67,6 @@ jobs:
           --icon packaging/icon.ico
           nvidia_failover_proxy.py
 
-      - name: Build executable (macOS)
-        if: runner.os == 'macOS'
-        run: >
-          pyinstaller --onefile --name nvidia-failover-proxy
-          --collect-submodules uvicorn
-          --icon packaging/icon.icns
-          nvidia_failover_proxy.py
-
       - name: Build executable (Linux)
         if: runner.os == 'Linux'
         run: >
@@ -96,18 +84,6 @@ jobs:
           New-Item -ItemType Directory -Force out | Out-Null
           Copy-Item dist\nvidia-failover-proxy.exe "out\nvidia-failover-proxy-${{ matrix.target }}.exe"
           Copy-Item installer\nvidia-failover-proxy-setup.exe "out\nvidia-failover-proxy-setup-${{ matrix.target }}.exe"
-
-      # ---- Package: macOS .dmg ---------------------------------------------
-      - name: Build macOS dmg
-        if: runner.os == 'macOS'
-        run: |
-          mkdir -p out dmgroot
-          cp dist/nvidia-failover-proxy dmgroot/nvidia-failover-proxy
-          cp README.md dmgroot/README.md
-          chmod +x dmgroot/nvidia-failover-proxy
-          hdiutil create -volname "NVIDIA Failover Proxy" -srcfolder dmgroot -ov -format UDZO \
-            "out/nvidia-failover-proxy-${{ matrix.target }}.dmg"
-          cp dist/nvidia-failover-proxy "out/nvidia-failover-proxy-${{ matrix.target }}"
 
       # ---- Package: Linux AppImage -----------------------------------------
       - name: Build Linux AppImage
