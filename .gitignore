@@ -18,3 +18,4 @@ proxy5003.out.log
 session_run.log
 models/
 llama.cpp/
+build_cuda.bat
