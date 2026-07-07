@@ -12,7 +12,8 @@ it and get resilient, multi-provider inference behind a single endpoint.
   from live 429s and proactively routes around models about to throttle.
 - **Local tail rung** — an optional local Ollama model as the guaranteed last resort
   when the whole cloud tier is cooling.
-- **Live dashboard** — SSE dashboard with per-model state, token accounting, drag-and-drop
+- **Live dashboard** — SSE dashboard with per-model state, token accounting, an estimated
+  **money-saved** figure (what the same tokens would cost at a commercial API), drag-and-drop
   failover ladder, model toggles, provider management (with brand icons), and live model
   discovery.
 - **SQLite persistence** — provider config, API keys, and learned stats live in a single
@@ -220,6 +221,12 @@ variables set defaults and infrastructure:
 | `PROXY_LOCAL_FALLBACK` | `1` | set `0` to disable the local tail rung |
 | `PROXY_MODEL_TIMEOUT_S` | `90` | per-model read timeout before failing over |
 | `PROXY_MAX_TOKENS_DEFAULT` | `8192` | `max_tokens` used when the client sends none (a client value always wins). Safe floor — raising it makes lower-cap models `400` and burn a failover hop per request; only bump it if every model in your ladder supports a larger output window |
+| `PROXY_PRICING_JSON` | built-in table | JSON object of `{"<model-substring>": [in_per_1M, out_per_1M]}` (USD) used for the dashboard's estimated **money-saved** figure. Matched case-insensitively by substring, first hit wins. Overrides/extends the built-in per-family rates |
+| `PROXY_PRICING_DEFAULT` | `0.50,1.50` | `in,out` USD per 1M tokens for models not matched by the pricing table |
+| `PROXY_GUARD_DEGENERATE` | `1` | fail over when a model degenerates — `finish_reason=repetition` or an unexpected **CJK code-switch** (e.g. kimi drifting into Chinese on long coding prompts). Streaming is truncated cleanly *before* the CJK reaches the client |
+| `PROXY_CJK_MIN_CHARS` | `4` | how many unexpected CJK chars (in a non-CJK prompt) count as a code-switch. Cumulative, not a run — kimi interleaves Chinese with Latin/code, which defeats run/fraction thresholds. Genuine CJK requests are never touched (guard keys off the prompt) |
+| `PROXY_FREQ_PENALTY_JSON` / `PROXY_FREQ_PENALTY_DEFAULT` | `{"kimi-k2":0.3}` / `0` | per-model / global `frequency_penalty` injected when the client sends none (mild repetition mitigation) |
+| `PROXY_RPM_LIMIT_FLOOR` / `PROXY_TPM_IN_LIMIT_FLOOR` / `PROXY_TPM_OUT_LIMIT_FLOOR` | `5` / `8000` / `2000` | floors under the *learned* rate-limit ceilings when deciding to skip a model. A 429 under low traffic (a quota, not a rate limit) would otherwise teach a ceiling so low the model is skipped forever |
 | `REFINER_BASE_URL` / `REFINER_MODEL` | Ollama / `qwen3:4b` | prompt-refiner endpoint |
 | `PROXY_REFINER_ENABLE` | `1` | enable the `[refine]` prompt refiner |
 

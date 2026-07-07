@@ -134,6 +134,127 @@ _CONNECT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 # a larger output window. A client-supplied max_tokens always wins.
 _DEFAULT_MAX_TOKENS = int(os.environ.get("PROXY_MAX_TOKENS_DEFAULT", "8192"))
 
+# --- Estimated money-saved accounting ----------------------------------------
+# NVIDIA NIM is free on a personal account, so every token this proxy serves is
+# spend AVOIDED at a commercial API. To estimate the savings we price each model
+# at a representative commercial rate (USD per 1M tokens, input / output) for the
+# same open-weight model at typical hosts (OpenRouter / Together / DeepInfra,
+# mid-2026). These are deliberately rough — the point is an order-of-magnitude
+# "money saved" figure, not an invoice. Matching is by case-insensitive substring
+# against the model id, first hit wins, so keep more-specific keys earlier.
+# Override any entry (or add models) with PROXY_PRICING_JSON, e.g.
+#   PROXY_PRICING_JSON='{"kimi-k2": [0.6, 2.5], "my-model": [1.0, 3.0]}'
+# and the unmatched-model fallback with PROXY_PRICING_DEFAULT="in,out".
+_MODEL_PRICING_DEFAULT: Dict[str, tuple] = {
+    "kimi-k2": (0.50, 2.00),
+    "moonshot": (0.50, 2.00),
+    "glm": (0.55, 2.19),
+    "deepseek": (0.55, 2.19),
+    "qwen": (0.30, 1.20),
+    "nemotron": (0.20, 0.60),
+    "llama": (0.20, 0.60),
+    "mistral": (0.30, 0.90),
+    "mixtral": (0.30, 0.90),
+    "gpt-oss": (0.30, 1.20),
+    "phi": (0.15, 0.45),
+    "gemma": (0.15, 0.45),
+}
+
+
+def _default_pricing_rate() -> tuple:
+    raw = os.environ.get("PROXY_PRICING_DEFAULT", "").strip()
+    if raw:
+        try:
+            a, b = raw.split(",")
+            return (float(a), float(b))
+        except Exception:
+            print(f"[pricing] ignoring bad PROXY_PRICING_DEFAULT={raw!r}")
+    return (0.50, 1.50)  # per 1M in / out for models with no table match
+
+
+def _load_pricing() -> Dict[str, tuple]:
+    table = dict(_MODEL_PRICING_DEFAULT)
+    raw = os.environ.get("PROXY_PRICING_JSON", "").strip()
+    if raw:
+        try:
+            for k, v in json.loads(raw).items():
+                table[k.lower()] = (float(v[0]), float(v[1]))
+        except Exception as e:
+            print(f"[pricing] ignoring bad PROXY_PRICING_JSON: {e}")
+    return table
+
+
+_MODEL_PRICING = _load_pricing()
+_PRICING_DEFAULT_RATE = _default_pricing_rate()
+
+
+def _price_for(model: str) -> tuple:
+    """(in, out) USD per 1M tokens the equivalent model would cost commercially."""
+    ml = (model or "").lower()
+    for key, rate in _MODEL_PRICING.items():
+        if key in ml:
+            return rate
+    return _PRICING_DEFAULT_RATE
+
+
+def _saved_usd(model: str, tokens_in, tokens_out) -> float:
+    pin, pout = _price_for(model)
+    return (tokens_in or 0) / 1_000_000 * pin + (tokens_out or 0) / 1_000_000 * pout
+
+
+def _fmt_money(v: float) -> str:
+    """Compact USD: bigger numbers lose the cents, sub-dollar keeps precision."""
+    if not v:
+        return "$0"
+    if v >= 1000:
+        return f"${v:,.0f}"
+    if v >= 1:
+        return f"${v:,.2f}"
+    return f"${v:.4f}".rstrip("0").rstrip(".")
+
+
+# --- Per-model repetition guard ----------------------------------------------
+# Some NIM models (notably moonshotai/kimi-k2.6) periodically fall into a
+# degenerate repetition loop on long "explain thoroughly" prompts and, once
+# looping, code-switch to Chinese — NIM surfaces this as finish_reason=repetition.
+# A mild frequency_penalty breaks the loop. We inject one ONLY for models that
+# need it, and ONLY when the client didn't send frequency_penalty (client wins).
+# Matched case-insensitively by substring; override with PROXY_FREQ_PENALTY_JSON,
+# e.g. PROXY_FREQ_PENALTY_JSON='{"kimi-k2":0.4,"some-model":0.3}'. A global
+# default for all other models can be set with PROXY_FREQ_PENALTY_DEFAULT (0=off).
+_FREQ_PENALTY_DEFAULT_TABLE: Dict[str, float] = {
+    "kimi-k2": 0.3,
+}
+
+
+def _load_freq_penalties() -> Dict[str, float]:
+    table = dict(_FREQ_PENALTY_DEFAULT_TABLE)
+    raw = os.environ.get("PROXY_FREQ_PENALTY_JSON", "").strip()
+    if raw:
+        try:
+            for k, v in json.loads(raw).items():
+                table[k.lower()] = float(v)
+        except Exception as e:
+            print(f"[freq-penalty] ignoring bad PROXY_FREQ_PENALTY_JSON: {e}")
+    return table
+
+
+_FREQ_PENALTY_TABLE = _load_freq_penalties()
+try:
+    _FREQ_PENALTY_GLOBAL = float(os.environ.get("PROXY_FREQ_PENALTY_DEFAULT", "0") or 0)
+except ValueError:
+    _FREQ_PENALTY_GLOBAL = 0.0
+
+
+def _freq_penalty_for(model: str):
+    """frequency_penalty to inject for this model when the client sent none."""
+    ml = (model or "").lower()
+    for key, val in _FREQ_PENALTY_TABLE.items():
+        if key in ml:
+            return val
+    return _FREQ_PENALTY_GLOBAL or None
+
+
 # Agent profile model IDs — same cloud ladder but inject a role system prompt.
 # OpenCode picks these up as separate models for multi-agent workflows.
 AGENT_ROLES = {
@@ -180,6 +301,16 @@ LOCAL_ENABLE = os.environ.get("PROXY_LOCAL_FALLBACK", "1").lower() not in (
 )
 LOCAL_BASE_URL = os.environ.get("LOCAL_OLLAMA_URL", "http://127.0.0.1:11434/v1")
 LOCAL_MODEL = os.environ.get("LOCAL_MODEL", "Qwen3-Coder-Next-80b-A3B:latest")
+
+
+def _strip_v1(url: str) -> str:
+    """Base URL without a trailing /v1 — for Ollama's native (non-OpenAI) API.
+    NOT rstrip("/v1"): that strips *characters* and would eat a port ending in
+    1/v (e.g. http://host:11431/v1 → http://host:1143)."""
+    u = (url or "").strip().rstrip("/")
+    if u.endswith("/v1"):
+        u = u[: -len("/v1")].rstrip("/")
+    return u
 
 
 def _ladder() -> List[str]:
@@ -624,6 +755,13 @@ _RPM_WINDOW_S = 60.0  # rolling window for requests-per-minute
 # Skip a model if its live rate is at/above this fraction of its learned ceiling.
 # 0.85 = give 15% headroom before we expect a throttle.
 _THROTTLE_RATIO = 0.85
+# Floors under the learned ceilings. A 429 that fires under low traffic (e.g. a
+# daily quota, not a rate limit) would otherwise teach limit_rpm≈1 and the
+# throttle check would then skip the model at ~1 rpm forever — a death spiral.
+# The learned value is kept as-is; the floor applies only when *checking*.
+_RPM_LIMIT_FLOOR = float(os.environ.get("PROXY_RPM_LIMIT_FLOOR", "5"))
+_TPM_IN_LIMIT_FLOOR = float(os.environ.get("PROXY_TPM_IN_LIMIT_FLOOR", "8000"))
+_TPM_OUT_LIMIT_FLOOR = float(os.environ.get("PROXY_TPM_OUT_LIMIT_FLOOR", "2000"))
 
 
 class Stats:
@@ -718,20 +856,25 @@ class Stats:
         return None
 
     def is_near_limit(self, model: str) -> bool:
-        """True if model's current throughput is at/above the learned ceiling."""
+        """True if model's current throughput is at/above the learned ceiling.
+        Learned ceilings are floored (see _RPM_LIMIT_FLOOR) so a 429 observed
+        under low traffic can't teach a ceiling so low the model is never tried."""
         # RPM check
         lim_rpm = self.models.get(model, {}).get("limit_rpm")
-        if lim_rpm is not None and self.live_rpm(model) >= lim_rpm * _THROTTLE_RATIO:
+        if lim_rpm is not None and self.live_rpm(model) >= (
+            max(lim_rpm, _RPM_LIMIT_FLOOR) * _THROTTLE_RATIO
+        ):
             return True
         # TPM-in check
         lim_tpi = self.models.get(model, {}).get("limit_tpm_in")
-        if lim_tpi is not None and self.live_tpm_in(model) >= lim_tpi * _THROTTLE_RATIO:
+        if lim_tpi is not None and self.live_tpm_in(model) >= (
+            max(lim_tpi, _TPM_IN_LIMIT_FLOOR) * _THROTTLE_RATIO
+        ):
             return True
         # TPM-out check
         lim_tpo = self.models.get(model, {}).get("limit_tpm_out")
-        if (
-            lim_tpo is not None
-            and self.live_tpm_out(model) >= lim_tpo * _THROTTLE_RATIO
+        if lim_tpo is not None and self.live_tpm_out(model) >= (
+            max(lim_tpo, _TPM_OUT_LIMIT_FLOOR) * _THROTTLE_RATIO
         ):
             return True
         return False
@@ -882,6 +1025,13 @@ stats = Stats.load()
 app = FastAPI(title="nvidia-failover-proxy")
 
 
+def _serving_ladder() -> List[str]:
+    """The cloud models the cascade will actually try, in order. Routing uses
+    the user-configured ladder (web UI / SQLite); the built-in env ladder is
+    only a display fallback for a fresh, unconfigured install."""
+    return ladder_config.active_ladder() or list(cascade.models)
+
+
 def _headers() -> Dict[str, str]:
     key = ladder_config.resolved_nvidia_key()
     return {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
@@ -979,7 +1129,7 @@ async def _refine_prompt(messages: List[dict], timeout: httpx.Timeout) -> List[d
             # Ollama to evict any other model from GPU memory first.
             try:
                 await client.post(
-                    f"{REFINER_BASE_URL.rstrip('/v1')}/api/generate",
+                    f"{_strip_v1(REFINER_BASE_URL)}/api/generate",
                     json={"model": REFINER_MODEL, "prompt": "", "keep_alive": 0},
                     timeout=httpx.Timeout(connect=10.0, read=10.0, write=5.0),
                 )
@@ -1048,12 +1198,87 @@ def _delta_has_content(obj: dict) -> bool:
     return False
 
 
+# --- Degenerate-output guard -------------------------------------------------
+# Detect the kimi-k2.6 (and similar) failure mode: a repetition loop that
+# code-switches to CJK. Used to fail over on the non-stream path and to abort a
+# fresh (not-yet-committed) stream before garbage reaches the client.
+GUARD_DEGENERATE = os.environ.get("PROXY_GUARD_DEGENERATE", "1").lower() not in (
+    "0", "false", "no", "",
+)
+# A degenerate model code-switches to CJK. We only guard when the *prompt* had
+# (essentially) no CJK, so genuine Chinese/Japanese/Korean requests are never
+# touched. In that case ANY meaningful amount of CJK in the answer is drift, so
+# we trip on a small absolute count rather than a fraction — kimi interleaves
+# Chinese with Latin/code, which defeats run- or fraction-based thresholds.
+_CJK_MIN_CHARS = int(os.environ.get("PROXY_CJK_MIN_CHARS", "4"))
+
+
+def _cjk_count(s: str) -> int:
+    # CJK Unified + common Japanese kana ranges; enough to catch a code-switch.
+    return sum(
+        1 for ch in s
+        if "一" <= ch <= "鿿"
+        or "぀" <= ch <= "ヿ"
+        or "가" <= ch <= "힣"
+    )
+
+
+def _prompt_has_cjk(body: dict) -> bool:
+    # Only user/system messages express the user's intent. Assistant history is
+    # excluded on purpose: a prior degenerate CJK reply in the conversation must
+    # not disarm the guard for every following turn.
+    for m in body.get("messages") or []:
+        if m.get("role") not in ("user", "system"):
+            continue
+        c = m.get("content")
+        if isinstance(c, str) and _cjk_count(c) >= 3:
+            return True
+        if isinstance(c, list):  # multimodal content parts
+            for part in c:
+                if isinstance(part, dict) and _cjk_count(part.get("text") or "") >= 3:
+                    return True
+    return False
+
+
+def _unexpected_cjk(text: str, body: dict) -> bool:
+    """True if the response is heavily CJK but the prompt wasn't (a code-switch)."""
+    if not text or _prompt_has_cjk(body):
+        return False
+    # Absolute count only: kimi interleaves Chinese with Latin/code when it
+    # degenerates, so a run- or fraction-based test lets large amounts through.
+    return _cjk_count(text) >= _CJK_MIN_CHARS
+
+
+def _delta_text(obj: dict) -> str:
+    choices = obj.get("choices") or []
+    if not choices:
+        return ""
+    return (choices[0].get("delta") or {}).get("content") or ""
+
+
+def _degenerate_reason(text: str, finish_reason, body: dict):
+    """Return a short reason string if this looks degenerate, else None."""
+    if not GUARD_DEGENERATE:
+        return None
+    if finish_reason == "repetition":
+        return "finish_reason=repetition"
+    if _unexpected_cjk(text or "", body):
+        return "unexpected CJK code-switch"
+    return None
+
+
 def _prep_body(body: dict, model: str) -> dict:
     out = dict(body)
     out["model"] = model
     # NIM quirk: some models return empty content unless max_tokens is set.
     # Client-supplied value always wins; see _DEFAULT_MAX_TOKENS for the rationale.
     out.setdefault("max_tokens", _DEFAULT_MAX_TOKENS)
+    # Repetition guard: inject a mild frequency_penalty for models prone to
+    # degenerate loops (e.g. kimi-k2.6 → Chinese). Client value always wins.
+    if "frequency_penalty" not in out:
+        fp = _freq_penalty_for(model)
+        if fp:
+            out["frequency_penalty"] = fp
     # Streaming: ask for a final usage chunk so we can track tokens per model.
     if out.get("stream"):
         so = dict(out.get("stream_options") or {})
@@ -1064,10 +1289,12 @@ def _prep_body(body: dict, model: str) -> dict:
 
 @app.get("/health")
 async def health() -> dict:
-    key = resolve_api_key()
+    key = ladder_config.resolved_nvidia_key()
+    # Healthy = any configured provider (keys live per-provider now), or the
+    # legacy NVIDIA key for installs that pre-date providers.
     agent_descs = {k: v.split(".")[0][:60] for k, v in AGENT_ROLES.items()}
     return {
-        "ok": bool(key),
+        "ok": bool(ladder_config.providers) or bool(key),
         "modes": {
             AUTO_MODEL: "cloud ladder then local 80B",
             ONLY_MODEL: "cloud ladder only, 429 when all cooling",
@@ -1076,7 +1303,7 @@ async def health() -> dict:
             LOCAL_REFINE: f"[refine]→{REFINER_MODEL} → local 80B",
             **agent_descs,
         },
-        "models": cascade.models,
+        "models": _serving_ladder(),
         "local_fallback": cascade._local_model(),
         "refiner": {
             "enabled": REFINER_ENABLE,
@@ -1102,6 +1329,9 @@ def _model_view() -> List[dict]:
     names = [m for m in _known_models() if ladder_config.is_enabled(m)]
     if local_model and local_model not in names:
         names.append(local_model)
+    # The "active" model is the first live rung in ladder order — the one that
+    # serves the next request. Mark it so the dashboard can show a green dot.
+    active_seen = False
     for name in names:
         m = stats.models.get(name, {})
         until = cascade.model_until.get(name, 0.0)
@@ -1114,10 +1344,14 @@ def _model_view() -> List[dict]:
             state = "cooling"
         else:
             state = "live"
+        is_active = state == "live" and not active_seen
+        if is_active:
+            active_seen = True
         rows.append(
             {
                 "model": name,
                 "state": state,
+                "active": is_active,
                 "cooling_s": cooling,
                 "requests": m.get("requests", 0),
                 "successes": m.get("successes", 0),
@@ -1152,6 +1386,9 @@ def _model_view() -> List[dict]:
                 "tokens_total": m.get("tokens_total", 0),
                 "last_in": m.get("last_in", 0),
                 "last_out": m.get("last_out", 0),
+                "saved_usd": _saved_usd(
+                    name, m.get("tokens_in", 0), m.get("tokens_out", 0)
+                ),
             }
         )
     return rows
@@ -1159,10 +1396,12 @@ def _model_view() -> List[dict]:
 
 @app.get("/stats")
 async def stats_json() -> dict:
+    models = _model_view()
     return {
-        "models": _model_view(),
+        "models": models,
         "window_s": int(_RPM_WINDOW_S),
         "db_file": DB_FILE,
+        "saved_usd_total": round(sum(m.get("saved_usd", 0.0) for m in models), 4),
     }
 
 
@@ -1174,6 +1413,18 @@ def _fmt_tpm(val) -> str:
 def _fmt_ceiling(val) -> str:
     """Format a learned ceiling: human-readable int, or 'learning…'."""
     return f"{int(val):,}/min" if val is not None else "learning…"
+
+
+def _totals_row(rows: list, tot: dict) -> str:
+    """The TOTAL <tr> — kept inside <tbody> so SSE refreshes it live."""
+    return (
+        f"<tr class=tot><td></td><td>TOTAL ({len(rows)} models)</td><td></td><td></td>"
+        f"<td>{tot['requests']}</td><td>{tot['successes']}</td><td>{tot['rate_limited']}</td>"
+        f"<td></td><td></td><td></td><td></td><td></td><td></td><td></td>"
+        f"<td class=num>{_fmt_num(tot['tokens_in'])}</td><td class=num>{_fmt_num(tot['tokens_out'])}</td>"
+        f"<td class=num>{_fmt_num(tot['tokens_total'])}</td>"
+        f"<td class=num><span class=save>{_fmt_money(tot['saved_usd'])}</span></td></tr>"
+    )
 
 
 async def _live_tbody() -> str:
@@ -1193,6 +1444,7 @@ async def _live_tbody() -> str:
         "tokens_in": 0,
         "tokens_out": 0,
         "tokens_total": 0,
+        "saved_usd": 0.0,
     }
     trs = []
     for i, r in enumerate(rows):
@@ -1234,16 +1486,18 @@ async def _live_tbody() -> str:
         )
         tpi = f"{_fmt_tpm(r['live_tpm_in'])} <span class=dim>(peak {_fmt_tpm(r['peak_tpm_in'])})</span>"
         tpo = f"{_fmt_tpm(r['live_tpm_out'])} <span class=dim>(peak {_fmt_tpm(r['peak_tpm_out'])})</span>"
+        saved = f'<span class=save>{_fmt_money(r["saved_usd"])}</span>' if r["saved_usd"] else "—"
         trs.append(
-            f"<tr><td class=n>{i + 1}</td><td class=m>{r['model']}</td><td>{badge}</td>"
+            f"<tr><td class=n>{i + 1}</td><td class=m>{_ACTIVE_DOT if r.get('active') else ''}{r['model']}</td><td>{badge}</td>"
             f"<td>{avail}</td><td>{r['requests']}</td><td>{r['successes']}</td>"
             f"<td>{r['rate_limited']}</td><td>{r['live_rpm']} <span class=dim>(peak {r['peak_rpm']})</span></td>"
             f"<td>{limit_rpm}</td><td>{_fmt_ceiling(r['learned_limit_tpm_in'])}</td>"
             f"<td>{_fmt_ceiling(r['learned_limit_tpm_out'])}</td><td>{tpi}</td><td>{tpo}</td>"
             f"<td>{cd}</td>"
-            f"<td class=num>{tin}</td><td class=num>{tout}</td><td class=num>{_fmt_num(r['tokens_total'])}</td></tr>"
+            f"<td class=num>{tin}</td><td class=num>{tout}</td><td class=num>{_fmt_num(r['tokens_total'])}</td>"
+            f"<td class=num>{saved}</td></tr>"
         )
-    return "".join(trs)
+    return "".join(trs) + _totals_row(rows, tot)
 
 
 @app.get("/updates")
@@ -1284,6 +1538,10 @@ def _fmt_dur(secs) -> str:
 
 def _fmt_num(n) -> str:
     return f"{int(n):,}" if n else "—"
+
+
+# Pulsing green dot shown next to the active (head-of-ladder, live) model.
+_ACTIVE_DOT = '<span class="dot" title="active model — serves the next request"></span>'
 
 
 # Stylized green-on-black "eye" mark (NVIDIA brand colors, #76b900) — used as the
@@ -1687,7 +1945,7 @@ def _ollama_live_models() -> List[str]:
     Falls back to the provider's configured model list on any error so the
     UI dropdown is never empty when Ollama is temporarily unreachable."""
     p = ladder_config.providers.get("ollama", {})
-    base = p.get("base_url", "").rstrip("/v1").rstrip("/")
+    base = _strip_v1(p.get("base_url", ""))
     if not base:
         return list(p.get("models", []))
     try:
@@ -1743,7 +2001,10 @@ def _settings_view() -> dict:
 
 @app.get("/_settings")
 async def get_settings():
-    return JSONResponse(_settings_view())
+    # _settings_view does a blocking Ollama /api/tags probe (up to 5s when the
+    # host is unreachable) — run it off the event loop so the dashboard SSE and
+    # in-flight completions never stall behind the settings panel.
+    return JSONResponse(await asyncio.to_thread(_settings_view))
 
 
 @app.post("/_settings")
@@ -1778,7 +2039,7 @@ async def post_settings(request: Request):
         ladder_config.set_local_tail(model if model else None)
     else:
         return JSONResponse({"error": f"unknown action {action!r}"}, status_code=400)
-    return JSONResponse({"ok": True, **_settings_view()})
+    return JSONResponse({"ok": True, **(await asyncio.to_thread(_settings_view))})
 
 
 async def _fetch_model_ids(base_url: str, key: Optional[str]) -> dict:
@@ -1849,6 +2110,7 @@ async def dashboard() -> str:
         "tokens_in": 0,
         "tokens_out": 0,
         "tokens_total": 0,
+        "saved_usd": 0.0,
     }
     trs = []
     for i, r in enumerate(rows):
@@ -1890,22 +2152,19 @@ async def dashboard() -> str:
         )
         tpi = f"{_fmt_tpm(r['live_tpm_in'])} <span class=dim>(peak {_fmt_tpm(r['peak_tpm_in'])})</span>"
         tpo = f"{_fmt_tpm(r['live_tpm_out'])} <span class=dim>(peak {_fmt_tpm(r['peak_tpm_out'])})</span>"
+        saved = f'<span class=save>{_fmt_money(r["saved_usd"])}</span>' if r["saved_usd"] else "—"
         trs.append(
-            f"<tr><td class=n>{i + 1}</td><td class=m>{r['model']}</td><td>{badge}</td>"
+            f"<tr><td class=n>{i + 1}</td><td class=m>{_ACTIVE_DOT if r.get('active') else ''}{r['model']}</td><td>{badge}</td>"
             f"<td>{avail}</td><td>{r['requests']}</td><td>{r['successes']}</td>"
             f"<td>{r['rate_limited']}</td><td>{r['live_rpm']} <span class=dim>(peak {r['peak_rpm']})</span></td>"
             f"<td>{limit_rpm}</td><td>{_fmt_ceiling(r['learned_limit_tpm_in'])}</td>"
             f"<td>{_fmt_ceiling(r['learned_limit_tpm_out'])}</td><td>{tpi}</td><td>{tpo}</td>"
             f"<td>{cd}</td>"
-            f"<td class=num>{tin}</td><td class=num>{tout}</td><td class=num>{_fmt_num(r['tokens_total'])}</td></tr>"
+            f"<td class=num>{tin}</td><td class=num>{tout}</td><td class=num>{_fmt_num(r['tokens_total'])}</td>"
+            f"<td class=num>{saved}</td></tr>"
         )
-    foot = (
-        f"<tr class=tot><td></td><td>TOTAL ({len(rows)} models)</td><td></td><td></td>"
-        f"<td>{tot['requests']}</td><td>{tot['successes']}</td><td>{tot['rate_limited']}</td>"
-        f"<td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td>"
-        f"<td class=num>{_fmt_num(tot['tokens_in'])}</td><td class=num>{_fmt_num(tot['tokens_out'])}</td>"
-        f"<td class=num>{_fmt_num(tot['tokens_total'])}</td></tr>"
-    )
+    foot = _totals_row(rows, tot)
+    saved_hero = _fmt_money(tot["saved_usd"])
     key_ok = bool(ladder_config.providers)
     prov_n = len(ladder_config.providers)
     cfg_items = []
@@ -1934,6 +2193,12 @@ td.n{{color:#5b6472}} td.m{{font-family:ui-monospace,Consolas,monospace;font-siz
 td.num{{text-align:right;font-variant-numeric:tabular-nums}}
 .dim{{color:#5b6472}} tr:hover td{{background:#161a22}}
 tr.tot td{{border-top:2px solid #2a2f3a;font-weight:600;color:#c8cfda}}
+.save{{color:#76b900;font-weight:600;font-variant-numeric:tabular-nums}}
+.dot{{display:inline-block;width:8px;height:8px;border-radius:50%;background:#76b900;margin-right:7px;vertical-align:middle;box-shadow:0 0 0 0 rgba(118,185,0,.7);animation:pulse 1.8s infinite}}
+@keyframes pulse{{0%{{box-shadow:0 0 0 0 rgba(118,185,0,.6)}}70%{{box-shadow:0 0 0 6px rgba(118,185,0,0)}}100%{{box-shadow:0 0 0 0 rgba(118,185,0,0)}}}}
+.hero{{display:inline-flex;align-items:baseline;gap:10px;margin:0 0 16px;padding:10px 16px;background:#141822;border:1px solid #233318;border-left:3px solid #76b900;border-radius:8px}}
+.hero .amt{{font-size:22px;font-weight:700;color:#76b900;font-variant-numeric:tabular-nums}}
+.hero .lbl{{color:#8b95a5;font-size:12px}}
 .ok{{color:#2e7d32}} .bad{{color:#b71c1c}}
 .live{{color:#2e7d32}} .dead{{color:#b71c1c}} .connection{{font-size:9px;margin-left:8px;color:#5b6472}}
 h1{{display:flex;align-items:center;gap:10px}}
@@ -2021,6 +2286,7 @@ src.onerror=function(){{
 <h1>{_NV_LOGO_SVG}<span><span class=nvbrand>failover proxy</span> — live state <span class=connection style="font-size:10px">connecting...</span></span></h1>
 <div class=sub>{f"<span class=ok>{prov_n} provider(s)</span>" if key_ok else "<span class=bad>no providers — add one in Providers &amp; API keys</span>"}
  · live updates via SSE · models: auto, only, refine (+local refiner), local-only, local-refine, agent-*<span id=timer style="margin-left:10px;color:#5b6472">0s</span></div>
+<div class=hero title="Estimated spend avoided vs. running the same tokens on a commercial API (NVIDIA NIM is free on a personal account). Rough per-model rates — tune with PROXY_PRICING_JSON."><span class=amt>{saved_hero}</span><span class=lbl>estimated saved vs. commercial API pricing</span></div>
 <details id=cfgpanel><summary>&#9881; Failover ladder — drag to reorder, uncheck to disable</summary>
 <ul id=cfglist>{cfg_html}</ul>
 <div class=cfgbar><button id=cfgsave>Save order &amp; toggles</button><button id=cfgreset>Reload</button><span id=cfgstatus class=dim></span></div>
@@ -2044,7 +2310,8 @@ src.onerror=function(){{
 <th>429s</th><th>rpm now</th><th>learned RPM</th><th>learned TPM in</th><th>learned TPM out</th>
 <th class=num>TPM in now</th><th class=num>TPM out now</th><th>learned cooldown</th>
 <th class=num>tokens in</th><th class=num>tokens out</th><th class=num>tokens total</th>
-</tr></thead><tbody>{"".join(trs)}</tbody><tfoot>{foot}</tfoot></table>
+<th class=num title="Estimated spend avoided vs. commercial API pricing for the same tokens">$ saved</th>
+</tr></thead><tbody>{"".join(trs)}{foot}</tbody></table>
 </body></html>"""
     return html.replace("</body>", CFG_SCRIPT + SET_SCRIPT + "</body>")
 
@@ -2060,7 +2327,9 @@ async def list_models() -> dict:
         LOCAL_REFINE,
     ] + sorted(AGENT_ROLES)
     lm = cascade._local_model()
-    ids = special + cascade.models + ([lm] if lm else [])
+    ids = special + _serving_ladder() + ([lm] if lm else [])
+    seen: Set[str] = set()
+    ids = [m for m in ids if not (m in seen or seen.add(m))]
     return {
         "object": "list",
         "data": [
@@ -2122,9 +2391,9 @@ def _format_model_list() -> str:
             **{k: v.split(".")[0] for k, v in AGENT_ROLES.items()},
         }.get(m, "")
         lines.append(f"  {m:<30} {desc}")
-    lines.append(_fmt_header("NVIDIA Frontier Ladder"))
+    lines.append(_fmt_header("Failover Ladder"))
     now = time.time()
-    for m in cascade.models:
+    for m in _serving_ladder():
         cooling = cascade.model_until.get(m, 0)
         if m in cascade.dead:
             tag = "☠ dead"
@@ -2219,7 +2488,7 @@ async def _handle_command(body: dict) -> Optional[JSONResponse]:
 
     elif cmd == "cool" and args:
         model = " ".join(args)
-        if model in cascade.models:
+        if model in _serving_ladder():
             cascade.cool(model, _MODEL_COOLDOWN_S)
             msg = f"  ❄ **{model}** sidelined for {_fmt_dur(_MODEL_COOLDOWN_S)}"
         else:
@@ -2253,7 +2522,7 @@ async def _handle_command(body: dict) -> Optional[JSONResponse]:
                 ollama_url = (
                     ollama_prov.get("base_url", "http://127.0.0.1:11434/v1") or ""
                 ).strip()
-                native_base = ollama_url.rstrip("/v1").rstrip("/")
+                native_base = _strip_v1(ollama_url)
                 keep_alive = -1 if cmd == "warm" else 0
                 action = "warming" if cmd == "warm" else "unloading"
                 try:
@@ -2278,7 +2547,7 @@ async def _handle_command(body: dict) -> Optional[JSONResponse]:
         all_models = (
             [AUTO_MODEL, ONLY_MODEL, REFINER_MODEL_ID, LOCAL_ONLY, LOCAL_REFINE]
             + sorted(AGENT_ROLES)
-            + cascade.models
+            + _serving_ladder()
             + ([lm] if lm else [])
         )
         now = time.time()
@@ -2346,7 +2615,12 @@ async def _handle_command(body: dict) -> Optional[JSONResponse]:
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    body = await request.json()
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
+        return JSONResponse(
+            {"error": {"message": "request body is not valid JSON"}}, status_code=400
+        )
     preferred = body.get("model")
     stream = bool(body.get("stream"))
 
@@ -2461,6 +2735,14 @@ async def chat_completions(request: Request):
                     stats.record_error(model)
                     print(f"[proxy] {model}: empty completion; failing over")
                     continue
+                _choice0 = (data.get("choices") or [{}])[0]
+                _txt = (_choice0.get("message") or {}).get("content") or ""
+                _deg = _degenerate_reason(_txt, _choice0.get("finish_reason"), body)
+                if _deg:
+                    stats.record_error(model)
+                    cascade.cool(model, _CONNECT_COOLDOWN_S)
+                    print(f"[proxy] {model}: {_deg}; failing over")
+                    continue
                 stats.record_success(model)
                 data["_proxy_model"] = model  # trace which model actually served
                 print(f"[proxy] served by {model}")
@@ -2537,7 +2819,15 @@ async def _stream_cascade(body: dict, ladder: List[str], timeout: httpx.Timeout)
                         buffered: List[bytes] = []
                         committed = not SKIP_EMPTY
                         _stream_usage: Optional[dict] = None
+                        # Mid-stream code-switch guard: count unexpected CJK chars
+                        # cumulatively (a degenerate model drifting into Chinese)
+                        # and truncate cleanly the moment the count crosses the
+                        # threshold — checking *before* the offending chunk is
+                        # forwarded, so the Chinese never reaches the client.
+                        guard_cjk = GUARD_DEGENERATE and not _prompt_has_cjk(body)
+                        cjk_total = 0
                         async for line in resp.aiter_lines():
+                            drifted = False
                             if line.startswith("data:"):
                                 payload = line[5:].strip()
                                 if payload and payload != "[DONE]":
@@ -2553,8 +2843,27 @@ async def _stream_cascade(body: dict, ladder: List[str], timeout: httpx.Timeout)
                                                 obj
                                             ):
                                                 committed = True
+                                            if guard_cjk:
+                                                cjk_total += _cjk_count(
+                                                    _delta_text(obj)
+                                                )
+                                                if cjk_total >= _CJK_MIN_CHARS:
+                                                    drifted = True
                                     except ValueError:
                                         pass
+                            if committed and drifted:
+                                # Drifted into Chinese — stop WITHOUT emitting this
+                                # (CJK) chunk. Better a clean, truncated answer than
+                                # pages of CJK leaking to the client.
+                                if _stream_usage is not None:
+                                    stats.record_usage(model, _stream_usage)
+                                stats.record_success(model)
+                                print(
+                                    f"[proxy/stream] {model}: unexpected CJK "
+                                    f"code-switch mid-stream; truncating"
+                                )
+                                yield b"data: [DONE]\n\n"
+                                return
                             emit = (line + "\n").encode("utf-8")
                             if committed:
                                 for b in buffered:
