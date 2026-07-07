@@ -65,15 +65,22 @@ speaks the OpenAI chat API — at. Default port **5002**.
     ≥`PROXY_REP_MIN_RUN` chars — so a looping phrase like *"all we have to do is
     all we have to do is…"* is caught, while ordinary repeated words, list
     bullets, tables, and `----`/`====` rules are not.
-  - *(An earlier CJK code-switch guard was removed — the models behave better
-    without it, and it risked touching genuine Chinese/Japanese/Korean output.)*
+- **CJK-in-code guard** (`PROXY_GUARD_CJK_CODE`, default on) — a model may reply
+  in Chinese/Japanese/Korean in **prose** freely, but some models (kimi-k2.6)
+  code-switch to CJK *inside generated code* — e.g. a tool-call file write whose
+  content is Chinese comments — which corrupts the file. The guard fails over
+  (non-stream) or truncates + cools (streaming) when CJK lands in a **code
+  context** — a ``` fenced block or a `tool_calls[].function.arguments` payload —
+  **and only when the request's own prompt had no CJK** (so genuine CJK requests,
+  and edits to files that already contain CJK, are never touched). Threshold
+  `PROXY_CJK_CODE_MIN` (default 2 chars). Prose CJK is never blocked.
 - **Per-model frequency penalty** — a mild `frequency_penalty` is injected for
   models prone to loops (default `kimi-k2 → 0.3`); a client-supplied value
   always wins (`PROXY_FREQ_PENALTY_JSON`).
 - **Mid-stream error handling** — once real bytes reached the client, an
   upstream error ends the SSE stream cleanly with `[DONE]` (truncated but
   coherent) instead of splicing a second model's answer on.
-- **Stall / hang watchdog** (`PROXY_STREAM_STALL_S`, default 60 s) — the classic
+- **Stall / hang watchdog** (`PROXY_STREAM_STALL_S`, default 180 s) — the classic
   "model just stops mid-output" failure. httpx's read timeout only catches a
   *fully silent* socket; an upstream that holds the stream open while trickling
   SSE keepalives but emits no more tokens would otherwise hang forever. The proxy
@@ -81,9 +88,18 @@ speaks the OpenAI chat API — at. Default port **5002**.
   reached the client it fails over to the next rung; if output had already
   started it ends the stream cleanly with `[DONE]`. Only armed after the first
   token, so a slow first token on a big reasoning model isn't cut short.
+  **Reasoning-aware heartbeat:** the watchdog also resets on `reasoning_content` /
+  `reasoning` deltas (via `_delta_is_active`), so a reasoning model that thinks
+  silently for tens of seconds *before* emitting the visible answer or a tool_call
+  isn't mistaken for a stall and truncated mid-turn — the earlier bug that made
+  agentic clients (OpenCode) drop the pending tool_call and stop. `committed` /
+  serving / token-accounting still key off real output only (`_delta_has_content`).
 - **max_tokens floor** — NIM quirk: some models return empty output without
-  `max_tokens`; the proxy injects 8192 when the client sends none
-  (`PROXY_MAX_TOKENS_DEFAULT`).
+  `max_tokens`; the proxy injects `PROXY_MAX_TOKENS_DEFAULT` when the client
+  sends none (code default 8192; **CT 3000 runs 16384** via a systemd drop-in,
+  since 8192 was clipping large agent tool-call writes mid-JSON — an
+  `Unterminated string` in OpenCode's `write`). A model that can't honor the
+  value just 400s → the cascade fails over.
 - **Per-model read timeout** — a hung rung fails over after
   `PROXY_MODEL_TIMEOUT_S` (default 90 s) instead of hanging the request.
 

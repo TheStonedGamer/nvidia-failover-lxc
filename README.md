@@ -219,8 +219,8 @@ variables set defaults and infrastructure:
 | `LOCAL_OLLAMA_URL` | `http://10.0.0.142:11434/v1` | local Ollama base URL for the tail rung |
 | `LOCAL_MODEL` | `Qwen3-Coder-Next-80b-A3B:latest` | local model id |
 | `PROXY_LOCAL_FALLBACK` | `1` | set `0` to disable the local tail rung |
-| `PROXY_MODEL_TIMEOUT_S` | `90` | per-model read timeout (fully silent socket) before failing over |
-| `PROXY_STREAM_STALL_S` | `60` | max gap with no new content tokens mid-stream before the stream is treated as hung — fails over if nothing was sent yet, else ends the stream cleanly. Only armed after the first token so slow-starting reasoning models aren't cut |
+| `PROXY_MODEL_TIMEOUT_S` | `300` | per-model read timeout (fully silent socket) before failing over. Reasoning tokens count as bytes, so this only trips on true network silence |
+| `PROXY_STREAM_STALL_S` | `180` | max gap with no new content tokens mid-stream before the stream is treated as hung — fails over if nothing was sent yet, else ends the stream cleanly. Only armed after the first token, and also reset by `reasoning_content`/`reasoning` deltas so a silent reasoning phase before the answer/tool_call isn't cut |
 | `PROXY_STICKY_LADDER` | `1` | keep serving from the model that last served and only roll forward (wrapping) through the ladder as models rate-limit, instead of restarting at the top of the ladder every request. Set `0` for strict top-priority ordering. An explicit model id in the request always overrides the cursor |
 | `PROXY_SERVING_WINDOW_S` | `20` | how long (seconds) after its last content delta a model still counts as "currently serving" for the dashboard's green dot before it falls back to marking the model that would serve the next request |
 | `PROXY_MAX_TOKENS_DEFAULT` | `8192` | `max_tokens` used when the client sends none (a client value always wins). Safe floor — raising it makes lower-cap models `400` and burn a failover hop per request; only bump it if every model in your ladder supports a larger output window |
@@ -230,6 +230,8 @@ variables set defaults and infrastructure:
 | `PROXY_REP_MIN_REPEATS` | `8` | minimum consecutive identical repeats of a short unit before a same-language **repetition loop** is flagged degenerate (fail over / truncate + cool the model). Conservative so ordinary repeated words don't trip it |
 | `PROXY_REP_MAX_UNIT` | `60` | longest repeating unit (chars) the repetition guard considers — a degenerate loop repeats a *short* phrase; longer legitimate structure is ignored |
 | `PROXY_REP_MIN_RUN` | `80` | minimum total length (chars) of the repeated run before it counts as a loop — the run must also carry at least one alphanumeric char, so `----`/`====`/`####` rules and whitespace runs are exempt |
+| `PROXY_GUARD_CJK_CODE` | `1` | fail over / truncate when a model code-switches to CJK **inside a code context** — a ``` fenced block or a `tool_calls[].function.arguments` payload (where agent file-writes live). Armed only when the request's own prompt had **no** CJK, so genuine Chinese/Japanese/Korean requests and edits to files already containing CJK are never touched. Prose CJK is always allowed |
+| `PROXY_CJK_CODE_MIN` | `2` | minimum CJK chars in a code context before the CJK-in-code guard trips |
 | `PROXY_FREQ_PENALTY_JSON` / `PROXY_FREQ_PENALTY_DEFAULT` | `{"kimi-k2":0.3}` / `0` | per-model / global `frequency_penalty` injected when the client sends none (mild repetition mitigation) |
 | `PROXY_RPM_LIMIT_FLOOR` / `PROXY_TPM_IN_LIMIT_FLOOR` / `PROXY_TPM_OUT_LIMIT_FLOOR` | `5` / `8000` / `2000` | floors under the *learned* rate-limit ceilings when deciding to skip a model. A 429 under low traffic (a quota, not a rate limit) would otherwise teach a ceiling so low the model is skipped forever |
 | `REFINER_BASE_URL` / `REFINER_MODEL` | Ollama / `qwen3:4b` | prompt-refiner endpoint |

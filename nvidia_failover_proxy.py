@@ -270,10 +270,21 @@ def _freq_penalty_for(model: str):
 
 # Agent profile model IDs — same cloud ladder but inject a role system prompt.
 # OpenCode picks these up as separate models for multi-agent workflows.
+_CJK_CODE_RULE = (
+    " Write all code, identifiers, comments, and string literals in ASCII/English; "
+    "never emit Chinese or other CJK characters in source files or tool arguments."
+)
 AGENT_ROLES = {
-    "agent-planner": "You are a meticulous planning agent. Before answering, produce a clear numbered step-by-step plan. Then execute each step thoroughly.",
-    "agent-builder": "You are a builder agent. Implement solutions with clean, well-structured, production-ready code. Include error handling, logging, and tests.",
-    "agent-reviewer": "You are a review agent. Scrutinize code and plans for bugs, edge cases, security flaws, and performance issues. Be thorough but constructive.",
+    "agent-planner": "You are a meticulous planning agent. Before answering, produce a clear numbered step-by-step plan. Then execute each step thoroughly."
+    + _CJK_CODE_RULE,
+    "agent-builder": "You are a builder agent. Implement solutions with clean, well-structured, "
+    "production-ready code. Include error handling, logging, and tests. Do the work with tools "
+    "rather than describing it: when the next step is clear, call the tool immediately. Never end "
+    "your turn right after announcing an action — if you say you will create or edit a file, the "
+    "matching tool call MUST be in the same response, or the action never happens and the loop "
+    "stalls." + _CJK_CODE_RULE,
+    "agent-reviewer": "You are a review agent. Scrutinize code and plans for bugs, edge cases, security flaws, and performance issues. Be thorough but constructive."
+    + _CJK_CODE_RULE,
 }
 # Local model IDs — route directly to the local Ollama 80B instead of cloud.
 LOCAL_ONLY = "local-only"  # direct to local 80B
@@ -1288,6 +1299,25 @@ def _delta_has_content(obj: dict) -> bool:
     return False
 
 
+def _delta_is_active(obj: dict) -> bool:
+    """True if a delta shows the model is *doing something* — visible content,
+    a tool call, or reasoning tokens. Reasoning models (deepseek-v4, kimi,
+    nemotron) emit `reasoning_content`/`reasoning` deltas for a while *before*
+    the visible answer or the tool call; that phase is activity, not a stall, so
+    the content-idle watchdog must treat it as a heartbeat. Kept separate from
+    `_delta_has_content` so `committed`/serving/token-accounting still key off
+    real output only."""
+    if _delta_has_content(obj):
+        return True
+    choices = obj.get("choices") or []
+    if not choices:
+        return False
+    d = choices[0].get("delta") or {}
+    if (d.get("reasoning_content") or d.get("reasoning") or "").strip():
+        return True
+    return False
+
+
 # --- Degenerate-output guard -------------------------------------------------
 # Detect the kimi-k2.6 (and similar) failure mode: a repetition loop — a short
 # phrase emitted over and over ("all we have to do is all we have to do is …")
@@ -1305,6 +1335,63 @@ _REP_MIN_REPEATS = int(os.environ.get("PROXY_REP_MIN_REPEATS", "8"))
 _REP_MAX_UNIT = int(os.environ.get("PROXY_REP_MAX_UNIT", "60"))
 _REP_MIN_RUN = int(os.environ.get("PROXY_REP_MIN_RUN", "80"))
 
+# CJK-in-code guard. kimi-k2.6 (and friends) sometimes code-switch to Chinese and
+# emit it *inside generated code* — e.g. replacing a file's contents with Chinese
+# comments during a tool-call file write, which corrupts the file. We do NOT block
+# CJK in ordinary prose (models are allowed to "talk Chinese"); we only trip when
+# CJK lands in a *code context* — a ``` fenced block or a tool-call's arguments —
+# AND the user's own prompt contained no CJK (so genuine Chinese/Japanese/Korean
+# requests, or edits to files that already contain CJK, are never touched).
+GUARD_CJK_CODE = os.environ.get("PROXY_GUARD_CJK_CODE", "1").lower() not in (
+    "0", "false", "no", "",
+)
+_CJK_CODE_MIN = int(os.environ.get("PROXY_CJK_CODE_MIN", "2"))
+# Han, Hiragana, Katakana, half-width Katakana, Hangul, CJK compat/ext-A.
+_CJK_RE = re.compile(
+    "[぀-ヿ㐀-䶿一-鿿豈-﫿ｦ-ﾟ가-힯]"
+)
+
+
+def _cjk_count(text: str) -> int:
+    if not text:
+        return 0
+    return len(_CJK_RE.findall(text))
+
+
+def _prompt_has_cjk(body: dict) -> bool:
+    """True if the *user's own* prompt (user/system turns) carries CJK. Assistant
+    history is ignored so a prior leaked CJK reply can't disarm the guard."""
+    for m in body.get("messages", []) or []:
+        if m.get("role") not in ("user", "system"):
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            if _CJK_RE.search(c):
+                return True
+        elif isinstance(c, list):
+            for part in c:
+                if isinstance(part, dict) and _CJK_RE.search(part.get("text") or ""):
+                    return True
+    return False
+
+
+def _cjk_in_code_blocks(text: str) -> int:
+    """Count CJK chars that fall inside ``` fenced code blocks (odd-indexed splits
+    are inside a fence). CJK in surrounding prose is ignored."""
+    if not text or "```" not in text:
+        return 0
+    parts = text.split("```")
+    return sum(_cjk_count(parts[i]) for i in range(1, len(parts), 2))
+
+
+def _cjk_in_tool_calls(msg: dict) -> int:
+    """Count CJK chars in a completion's tool-call arguments — where file-write
+    content lives, so this is the corruption path we most need to catch."""
+    total = 0
+    for tc in (msg.get("tool_calls") or []):
+        total += _cjk_count(((tc.get("function") or {}).get("arguments")) or "")
+    return total
+
 # Anti-hang watchdog. httpx's read timeout resets on *any* byte, so an upstream
 # that stalls after partial output while still trickling SSE keepalives (or that
 # goes silent under our per-read `read` timeout window) will hang the stream with
@@ -1312,7 +1399,7 @@ _REP_MIN_RUN = int(os.environ.get("PROXY_REP_MIN_RUN", "80"))
 # additionally track wall-clock time since the last *content-bearing* delta and
 # treat too long a gap as a stall: fail over if nothing was delivered yet, else
 # end the stream cleanly so the client isn't left waiting forever.
-_STREAM_STALL_S = float(os.environ.get("PROXY_STREAM_STALL_S", "60"))
+_STREAM_STALL_S = float(os.environ.get("PROXY_STREAM_STALL_S", "180"))
 
 
 class _StreamStall(Exception):
@@ -1418,7 +1505,7 @@ def _estimate_usage(body: dict, out_chars: int) -> dict:
     }
 
 
-def _degenerate_reason(text: str, finish_reason, body: dict):
+def _degenerate_reason(text: str, finish_reason, body: dict, msg: dict = None):
     """Return a short reason string if this looks degenerate, else None."""
     if not GUARD_DEGENERATE:
         return None
@@ -1426,6 +1513,12 @@ def _degenerate_reason(text: str, finish_reason, body: dict):
         return "finish_reason=repetition"
     if _looping_tail(text or ""):
         return "degenerate repetition loop"
+    if GUARD_CJK_CODE and not _prompt_has_cjk(body):
+        n = _cjk_in_code_blocks(text or "")
+        if msg:
+            n += _cjk_in_tool_calls(msg)
+        if n >= _CJK_CODE_MIN:
+            return f"CJK in code output ({n} chars)"
     return None
 
 
@@ -2904,7 +2997,14 @@ async def chat_completions(request: Request):
     # Per-model read timeout: if a model stalls (slow/hung upstream), fail over
     # to the next one instead of hanging the whole request. connect stays short
     # so an unreachable rung (e.g. local Ollama down) is skipped near-instantly.
-    read_t = float(os.environ.get("PROXY_MODEL_TIMEOUT_S", "90"))
+    # Generous read timeout: reasoning models (deepseek-v4, kimi, nemotron) can
+    # think silently for a minute-plus before the visible answer / tool call, and
+    # httpx's read timeout is the ONLY catch for a dead-silent socket before any
+    # bytes arrive. Too tight and an agentic turn gets its tool call truncated
+    # mid-think (client stops with an incomplete turn). Once tokens/reasoning
+    # start flowing, the content-idle watchdog (_STREAM_STALL_S) takes over and
+    # catches real hangs faster.
+    read_t = float(os.environ.get("PROXY_MODEL_TIMEOUT_S", "300"))
     timeout = httpx.Timeout(connect=15.0, read=read_t, write=30.0, pool=15.0)
 
     if stream:
@@ -2971,8 +3071,11 @@ async def chat_completions(request: Request):
                     print(f"[proxy] {model}: empty completion; failing over")
                     continue
                 _choice0 = (data.get("choices") or [{}])[0]
-                _txt = (_choice0.get("message") or {}).get("content") or ""
-                _deg = _degenerate_reason(_txt, _choice0.get("finish_reason"), body)
+                _msg0 = _choice0.get("message") or {}
+                _txt = _msg0.get("content") or ""
+                _deg = _degenerate_reason(
+                    _txt, _choice0.get("finish_reason"), body, _msg0
+                )
                 if _deg:
                     stats.record_error(model)
                     cascade.cool(model, _CONNECT_COOLDOWN_S)
@@ -3062,6 +3165,15 @@ async def _stream_cascade(body: dict, ladder: List[str], timeout: httpx.Timeout)
                         # before pages of garbage reach the client.
                         guard_rep = GUARD_DEGENERATE
                         rep_tail = ""
+                        # Mid-stream CJK-in-code guard: only armed when the user's
+                        # prompt had no CJK. Tracks whether we're inside a ``` fence
+                        # (across deltas) and counts CJK that lands in a code context
+                        # or in tool-call arguments (file-write content). Prose CJK is
+                        # ignored — models may reply in Chinese, just not in code.
+                        guard_cjk_code = GUARD_CJK_CODE and not _prompt_has_cjk(body)
+                        cjk_scan_buf = ""  # accumulated content, for fence-aware scan
+                        _CJK_SCAN_CAP = 262144  # stop scanning past 256KB (pathological)
+                        cjk_code_seen = 0  # CJK chars seen in tool-call arguments
                         # Content-idle watchdog: the moment the last real content
                         # delta arrived. A fully-silent socket is already caught by
                         # httpx's read timeout; this catches the other hang, where
@@ -3098,6 +3210,14 @@ async def _stream_cascade(body: dict, ladder: List[str], timeout: httpx.Timeout)
                                                 committed = True
                                                 out_chars += len(_delta_text(obj))
                                                 stats.note_serving(model)
+                                            elif _delta_is_active(obj):
+                                                # Reasoning tokens (pre-answer/
+                                                # pre-tool-call thinking) are a
+                                                # heartbeat — reset the idle
+                                                # watchdog so a long silent think
+                                                # isn't mistaken for a stall and
+                                                # truncated mid-turn.
+                                                last_content = time.monotonic()
                                             if guard_rep and _delta_has_content(obj):
                                                 rep_tail = (
                                                     rep_tail + _delta_text(obj)
@@ -3106,6 +3226,42 @@ async def _stream_cascade(body: dict, ladder: List[str], timeout: httpx.Timeout)
                                                     drifted = True
                                                     drift_reason = (
                                                         "degenerate repetition loop"
+                                                    )
+                                            if guard_cjk_code and not drifted:
+                                                _d = (
+                                                    obj.get("choices") or [{}]
+                                                )[0].get("delta") or {}
+                                                # CJK in tool-call arguments (where
+                                                # file-write content lives) — always a
+                                                # code context, count every delta.
+                                                for _tc in _d.get("tool_calls") or []:
+                                                    cjk_code_seen += _cjk_count(
+                                                        ((_tc.get("function") or {}).get(
+                                                            "arguments"
+                                                        )) or ""
+                                                    )
+                                                # CJK inside a ``` fenced block. Scan
+                                                # the accumulated content (handles a
+                                                # fence split across deltas) but only
+                                                # when a delta actually adds a backtick
+                                                # or CJK, so normal prose stays cheap.
+                                                _dt = _d.get("content") or ""
+                                                _code_cjk = 0
+                                                if _dt and len(cjk_scan_buf) < _CJK_SCAN_CAP:
+                                                    cjk_scan_buf += _dt
+                                                    if "`" in _dt or _CJK_RE.search(_dt):
+                                                        _code_cjk = _cjk_in_code_blocks(
+                                                            cjk_scan_buf
+                                                        )
+                                                if (
+                                                    cjk_code_seen + _code_cjk
+                                                    >= _CJK_CODE_MIN
+                                                ):
+                                                    drifted = True
+                                                    drift_reason = (
+                                                        "CJK in code output "
+                                                        f"({cjk_code_seen + _code_cjk} "
+                                                        "chars)"
                                                     )
                                     except ValueError:
                                         pass
