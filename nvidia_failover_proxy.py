@@ -111,6 +111,7 @@ PROVIDER_ENV: Dict[str, str] = {
     "google": "https://generativelanguage.googleapis.com/v1beta/openai",
     "xai": "https://api.x.ai/v1",
     "together": "https://api.together.xyz/v1",
+    "ollama": "http://127.0.0.1:11434/v1",
 }
 
 AUTO_MODEL = "nvidia-auto"  # cloud frontier ladder, then local 80B tail rung
@@ -303,17 +304,30 @@ class LadderConfig:
         For each entry in PROVIDER_ENV, if <PREFIX>_API_KEY is set and that
         provider isn't already configured, add it (with optional <PREFIX>_MODELS
         and <PREFIX>_BASE_URL). Only seeds when absent, so the web UI stays the
-        source of truth once a provider exists. Returns True if anything changed."""
+        source of truth once a provider exists. Returns True if anything changed.
+
+        Ollama is special: it does not require an API key (local) and its
+        default model list comes from OLLAMA_MODELS (or the legacy LOCAL_MODEL)."""
         changed = False
         for name, default_url in PROVIDER_ENV.items():
             if name in self.providers:
                 continue  # user/UI already owns this provider
             prefix = name.upper()
             key = (os.environ.get(f"{prefix}_API_KEY") or "").strip()
-            if not key:
+            # Ollama doesn't require an API key for local use
+            if not key and name != "ollama":
                 continue
             base_url = (os.environ.get(f"{prefix}_BASE_URL") or default_url).strip()
+            # Legacy LOCAL_OLLAMA_URL env var — only used when OLLAMA_BASE_URL is not set
+            if name == "ollama" and not os.environ.get(f"{prefix}_BASE_URL"):
+                legacy = (os.environ.get("LOCAL_OLLAMA_URL") or "").strip()
+                if legacy:
+                    base_url = legacy
+
             raw = os.environ.get(f"{prefix}_MODELS") or ""
+            # Legacy LOCAL_MODEL feeds into ollama model list if OLLAMA_MODELS not set
+            if name == "ollama" and not raw:
+                raw = os.environ.get("LOCAL_MODEL", "Qwen3-Coder-Next-80b-A3B:latest")
             if not raw and name == "nvidia":
                 raw = os.environ.get("ROUTER_NVIDIA_MODELS") or ""
             models = [m.strip() for m in raw.split(",") if m.strip()]
@@ -324,9 +338,13 @@ class LadderConfig:
                 "api_key": key,
                 "models": models,
             }
-            for m in models:
-                if m not in self.order:
-                    self.order.append(m)
+            # Ollama models are not added to the failover order — they serve as
+            # the local tail rung (handled by Cascade._local_model()) and can be
+            # added to the ladder manually via the UI if the user wants.
+            if name != "ollama":
+                for m in models:
+                    if m not in self.order:
+                        self.order.append(m)
             changed = True
         return changed
 
@@ -447,18 +465,48 @@ ladder_config = LadderConfig()
 
 
 class Cascade:
-    """Holds the frontier ladder plus per-model rate-limit / EOL state."""
+    """Holds the frontier ladder plus per-model rate-limit / EOL state.
+
+    The local tail rung is now sourced from the Ollama provider in
+    ladder_config (instead of a hardcoded env var). When no Ollama provider
+    exists, a legacy LOCAL_MODEL env fallback is used for backward compat.
+    """
 
     def __init__(self) -> None:
         self.models = _ladder()  # cloud (NVIDIA) frontier ladder
-        self.local = LOCAL_MODEL if LOCAL_ENABLE else None
         self.model_until: Dict[str, float] = {}  # model -> cooling-until epoch
         self.dead: Set[str] = set()  # 404/410 — dropped permanently
 
+    def _local_model(self) -> Optional[str]:
+        """First model from the Ollama provider, else legacy LOCAL_MODEL env."""
+        p = ladder_config.providers.get("ollama", {})
+        models = p.get("models", [])
+        if models:
+            return models[0]
+        # Backward compat: legacy env var fallback
+        if LOCAL_ENABLE:
+            return LOCAL_MODEL
+        return None
+
+    def _ollama_base_url(self) -> str:
+        """Base URL for the Ollama provider, else legacy LOCAL_OLLAMA_URL."""
+        p = ladder_config.providers.get("ollama", {})
+        url = p.get("base_url", "").strip()
+        if url:
+            return url
+        return LOCAL_BASE_URL
+
     def is_local(self, model: Optional[str]) -> bool:
-        return bool(self.local) and (
-            model == self.local or model in (LOCAL_ONLY, LOCAL_REFINE)
-        )
+        """True if model is the local Ollama fallback or a local-only alias."""
+        if not model:
+            return False
+        if model in (LOCAL_ONLY, LOCAL_REFINE):
+            return True
+        # Check if the model belongs to the Ollama provider.
+        p = ladder_config.providers.get("ollama", {})
+        if model in p.get("models", []):
+            return True
+        return bool(LOCAL_ENABLE) and model == LOCAL_MODEL
 
     def order(self, preferred: Optional[str]) -> List[str]:
         """Try `preferred` first (if it's a real, usable model), then cascade
@@ -488,10 +536,11 @@ class Cascade:
             and not stats.is_near_limit(m)
         ]
 
-        # If the caller explicitly asked for the local model, honor it first.
+        local = self._local_model()
+
+        # If the caller explicitly asked for a local model, honor it first.
         # local-only and local-refine route ONLY to local (no cloud fallback).
         if self.is_local(preferred):
-            local = self.local
             if not local:
                 return []
             if preferred in (LOCAL_ONLY, LOCAL_REFINE):
@@ -503,7 +552,7 @@ class Cascade:
             # cloud model is cooling, return empty so the caller returns 429.
             return cloud
 
-        ladder = cloud + ([self.local] if self.local else [])
+        ladder = cloud + ([local] if local else [])
         if not ladder:
             # No local rung and every cloud model cooling: try the one closest
             # to coming back rather than hard-failing.
@@ -818,7 +867,7 @@ def _route(model: str) -> tuple:
     """(base_url, headers) for a model — local Ollama needs no auth, custom
     providers use their own base_url + key, everything else goes to NVIDIA."""
     if cascade.is_local(model):
-        return LOCAL_BASE_URL, {"Content-Type": "application/json"}
+        return cascade._ollama_base_url(), {"Content-Type": "application/json"}
     prov = ladder_config.model_provider(model)
     if prov:
         base_url, key = prov
@@ -1003,7 +1052,7 @@ async def health() -> dict:
             **agent_descs,
         },
         "models": cascade.models,
-        "local_fallback": cascade.local,
+        "local_fallback": cascade._local_model(),
         "refiner": {
             "enabled": REFINER_ENABLE,
             "model": REFINER_MODEL,
@@ -1024,8 +1073,9 @@ def _model_view() -> List[dict]:
     rows: List[dict] = []
     # Follow the user-defined failover order from the web UI so the metrics table
     # matches the config panel; disabled models are hidden; local tail stays last.
+    local_model = cascade._local_model()
     names = [m for m in _known_models() if ladder_config.is_enabled(m)] + (
-        [cascade.local] if cascade.local else []
+        [local_model] if local_model else []
     )
     for name in names:
         m = stats.models.get(name, {})
@@ -1315,6 +1365,7 @@ PROVIDER_PRESETS: List[Dict[str, str]] = [
     },
     {"name": "xai", "base_url": "https://api.x.ai/v1"},
     {"name": "together", "base_url": "https://api.together.xyz/v1"},
+    {"name": "ollama", "base_url": "http://127.0.0.1:11434/v1"},
 ]
 
 
@@ -1518,10 +1569,15 @@ SET_SCRIPT = """<script>
 
 def _known_models() -> List[str]:
     """Saved user order, with any provider models not yet in the order appended
-    so the config UI shows every configured model. Empty when no providers."""
+    so the config UI shows every configured model. Empty when no providers.
+
+    Ollama-provider models are excluded — they serve as the local tail rung
+    (handled by Cascade._local_model()) and are not part of the failover order
+    unless the user explicitly adds them via the UI."""
+    ollama_models = set(ladder_config.providers.get("ollama", {}).get("models", []))
     known = list(ladder_config.order)
     for m in ladder_config.custom_models():
-        if m not in known:
+        if m not in known and m not in ollama_models:
             known.append(m)
     return known
 
@@ -1911,7 +1967,8 @@ async def list_models() -> dict:
         LOCAL_ONLY,
         LOCAL_REFINE,
     ] + sorted(AGENT_ROLES)
-    ids = special + cascade.models + ([cascade.local] if cascade.local else [])
+    lm = cascade._local_model()
+    ids = special + cascade.models + ([lm] if lm else [])
     return {
         "object": "list",
         "data": [
@@ -1984,8 +2041,9 @@ def _format_model_list() -> str:
         else:
             tag = "✓ live"
         lines.append(f"  {m:<55} {tag}")
-    if cascade.local:
-        lines.append(f"\n  {cascade.local:<55} local tail (always last)")
+    lm = cascade._local_model()
+    if lm:
+        lines.append(f"\n  {lm:<55} local tail (always last)")
     return "\n".join(lines)
 
 
@@ -2015,6 +2073,8 @@ async def _handle_command(body: dict) -> Optional[JSONResponse]:
             + "  /cool <model>  Manually sideline a model for 5min\n"
             + "  /uncool <model> Remove a model from cooldown\n"
             + "  /switch <model> Hint to switch active model\n"
+            + "  /warm [model]   Preload an Ollama model into GPU memory\n"
+            + "  /unload [model] Evict an Ollama model from GPU memory\n"
         )
 
     elif cmd == "stats":
@@ -2061,7 +2121,7 @@ async def _handle_command(body: dict) -> Optional[JSONResponse]:
             + f"  API key: {'✓ loaded' if key else '✗ missing'}\n"
             + f"  Dead models: {len(cascade.dead)}\n"
             + f"  Cooling models: {len(cooling)}\n"
-            + f"  Ladder size: {len(cascade.models)} cloud + {'yes' if cascade.local else 'no'} local\n"
+            + f"  Ladder size: {len(cascade.models)} cloud + {'yes' if cascade._local_model() else 'no'} local\n"
             + f"  Refiner: {'enabled' if REFINER_ENABLE else 'disabled'} ({REFINER_MODEL})\n"
         )
 
@@ -2085,13 +2145,49 @@ async def _handle_command(body: dict) -> Optional[JSONResponse]:
         model = " ".join(args)
         msg = f"  ↻ Switch hint noted: **{model}**\n  (OpenCode controls model selection; set it in the UI or config)"
 
+    elif cmd in ("warm", "unload"):
+        ollama_prov = ladder_config.providers.get("ollama", {})
+        ollama_models = ollama_prov.get("models", [])
+        if not ollama_models:
+            msg = "  ✗ No Ollama provider configured. Add one via the settings UI or set OLLAMA_MODELS."
+        else:
+            # Determine which model to warm/unload
+            target = " ".join(args) if args else ollama_models[0]
+            if target not in ollama_models:
+                known = ", ".join(ollama_models)
+                msg = f"  ✗ **{target}** is not in the Ollama model list.\n    Known Ollama models: {known}"
+            else:
+                # Build native Ollama API base URL (strip /v1 suffix)
+                ollama_url = (
+                    ollama_prov.get("base_url", "http://127.0.0.1:11434/v1") or ""
+                ).strip()
+                native_base = ollama_url.rstrip("/v1").rstrip("/")
+                keep_alive = -1 if cmd == "warm" else 0
+                action = "warming" if cmd == "warm" else "unloading"
+                try:
+                    async with httpx.AsyncClient(timeout=30.0) as client:
+                        resp = await client.post(
+                            f"{native_base}/api/generate",
+                            json={"model": target, "keep_alive": str(keep_alive)},
+                        )
+                    if resp.status_code in (200, 201):
+                        msg = f"  ✓ **{target}** {action} via Ollama (keep_alive={keep_alive})"
+                    else:
+                        msg = (
+                            f"  ✗ **{target}** {action} failed: HTTP {resp.status_code}\n"
+                            f"    {resp.text[:300]}"
+                        )
+                except httpx.RequestError as exc:
+                    msg = f"  ✗ **{target}** {action} failed — connection error: {exc}"
+
     elif cmd == "pick":
         # Build numbered list of all available models
+        lm = cascade._local_model()
         all_models = (
             [AUTO_MODEL, ONLY_MODEL, REFINER_MODEL_ID, LOCAL_ONLY, LOCAL_REFINE]
             + sorted(AGENT_ROLES)
             + cascade.models
-            + ([cascade.local] if cascade.local else [])
+            + ([lm] if lm else [])
         )
         now = time.time()
 
@@ -2116,7 +2212,7 @@ async def _handle_command(body: dict) -> Optional[JSONResponse]:
                     badge = " ◀"
                 elif m in cascade.dead:
                     badge = " ☠"
-                elif m in (LOCAL_ONLY, LOCAL_REFINE) and cascade.local:
+                elif m in (LOCAL_ONLY, LOCAL_REFINE) and cascade._local_model():
                     badge = " ⌂"
                 elif (
                     m in (AUTO_MODEL, ONLY_MODEL, REFINER_MODEL_ID) or m in AGENT_ROLES
