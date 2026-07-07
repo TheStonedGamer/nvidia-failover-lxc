@@ -1226,6 +1226,19 @@ GUARD_DEGENERATE = os.environ.get("PROXY_GUARD_DEGENERATE", "1").lower() not in 
 # Chinese with Latin/code, which defeats run- or fraction-based thresholds.
 _CJK_MIN_CHARS = int(os.environ.get("PROXY_CJK_MIN_CHARS", "4"))
 
+# Anti-hang watchdog. httpx's read timeout resets on *any* byte, so an upstream
+# that stalls after partial output while still trickling SSE keepalives (or that
+# goes silent under our per-read `read` timeout window) will hang the stream with
+# no new tokens ever arriving — the classic "model just stops mid-output". We
+# additionally track wall-clock time since the last *content-bearing* delta and
+# treat too long a gap as a stall: fail over if nothing was delivered yet, else
+# end the stream cleanly so the client isn't left waiting forever.
+_STREAM_STALL_S = float(os.environ.get("PROXY_STREAM_STALL_S", "30"))
+
+
+class _StreamStall(Exception):
+    """Raised when an upstream stream produces no new content for too long."""
+
 
 def _cjk_count(s: str) -> int:
     # CJK Unified + common Japanese kana ranges; enough to catch a code-switch.
@@ -2840,7 +2853,20 @@ async def _stream_cascade(body: dict, ladder: List[str], timeout: httpx.Timeout)
                         # forwarded, so the Chinese never reaches the client.
                         guard_cjk = GUARD_DEGENERATE and not _prompt_has_cjk(body)
                         cjk_total = 0
+                        # Content-idle watchdog: the moment the last real content
+                        # delta arrived. A fully-silent socket is already caught by
+                        # httpx's read timeout; this catches the other hang, where
+                        # the upstream keeps the stream open (often trickling SSE
+                        # keepalives) but stops producing tokens after some real
+                        # output. We only enforce it once content has started, so a
+                        # slow first token on a big reasoning model isn't cut.
+                        last_content = time.monotonic()
                         async for line in resp.aiter_lines():
+                            if (
+                                committed
+                                and time.monotonic() - last_content > _STREAM_STALL_S
+                            ):
+                                raise _StreamStall()
                             drifted = False
                             if line.startswith("data:"):
                                 payload = line[5:].strip()
@@ -2853,9 +2879,10 @@ async def _stream_cascade(body: dict, ladder: List[str], timeout: httpx.Timeout)
                                                 # loop, using the last (most
                                                 # complete) occurrence.
                                                 _stream_usage = obj["usage"]
-                                            if not committed and _delta_has_content(
-                                                obj
-                                            ):
+                                            if _delta_has_content(obj):
+                                                # Real token(s) landed — reset the
+                                                # idle watchdog and commit.
+                                                last_content = time.monotonic()
                                                 committed = True
                                             if guard_cjk:
                                                 cjk_total += _cjk_count(
@@ -2898,6 +2925,31 @@ async def _stream_cascade(body: dict, ladder: List[str], timeout: httpx.Timeout)
                         stats.record_error(model)
                         print(f"[proxy/stream] {model}: empty stream; failing over")
                         break  # next model
+                except _StreamStall:
+                    stats.record_error(model)
+                    if client_sent:
+                        # Real tokens already delivered, then the stream wedged.
+                        # We can't restart on another model (would splice a second
+                        # answer); record the partial and end cleanly so the client
+                        # gets a finished — if truncated — message instead of an
+                        # endless spinner.
+                        if _stream_usage is not None:
+                            stats.record_usage(model, _stream_usage)
+                        stats.record_success(model)
+                        print(
+                            f"[proxy/stream] {model}: stalled >{_STREAM_STALL_S:.0f}s "
+                            f"mid-output; ending cleanly"
+                        )
+                        yield b"data: [DONE]\n\n"
+                        return
+                    # Stalled before any content reached the client — sideline
+                    # briefly and fail over to the next rung.
+                    cascade.cool(model, _CONNECT_COOLDOWN_S)
+                    print(
+                        f"[proxy/stream] {model}: stalled >{_STREAM_STALL_S:.0f}s "
+                        f"before output; cooling {_CONNECT_COOLDOWN_S}s; next"
+                    )
+                    break
                 except _CONNECT_ERRORS as e:
                     # Connect never established, so nothing was sent. Retry once on
                     # a fresh connection, then only briefly sideline the model.

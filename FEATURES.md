@@ -59,6 +59,14 @@ speaks the OpenAI chat API — at. Default port **5002**.
 - **Mid-stream error handling** — once real bytes reached the client, an
   upstream error ends the SSE stream cleanly with `[DONE]` (truncated but
   coherent) instead of splicing a second model's answer on.
+- **Stall / hang watchdog** (`PROXY_STREAM_STALL_S`, default 30 s) — the classic
+  "model just stops mid-output" failure. httpx's read timeout only catches a
+  *fully silent* socket; an upstream that holds the stream open while trickling
+  SSE keepalives but emits no more tokens would otherwise hang forever. The proxy
+  tracks time since the last real content delta: if it stalls before any output
+  reached the client it fails over to the next rung; if output had already
+  started it ends the stream cleanly with `[DONE]`. Only armed after the first
+  token, so a slow first token on a big reasoning model isn't cut short.
 - **max_tokens floor** — NIM quirk: some models return empty output without
   `max_tokens`; the proxy injects 8192 when the client sends none
   (`PROXY_MAX_TOKENS_DEFAULT`).

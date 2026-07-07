@@ -219,7 +219,8 @@ variables set defaults and infrastructure:
 | `LOCAL_OLLAMA_URL` | `http://10.0.0.142:11434/v1` | local Ollama base URL for the tail rung |
 | `LOCAL_MODEL` | `Qwen3-Coder-Next-80b-A3B:latest` | local model id |
 | `PROXY_LOCAL_FALLBACK` | `1` | set `0` to disable the local tail rung |
-| `PROXY_MODEL_TIMEOUT_S` | `90` | per-model read timeout before failing over |
+| `PROXY_MODEL_TIMEOUT_S` | `90` | per-model read timeout (fully silent socket) before failing over |
+| `PROXY_STREAM_STALL_S` | `30` | max gap with no new content tokens mid-stream before the stream is treated as hung — fails over if nothing was sent yet, else ends the stream cleanly. Only armed after the first token so slow-starting reasoning models aren't cut |
 | `PROXY_MAX_TOKENS_DEFAULT` | `8192` | `max_tokens` used when the client sends none (a client value always wins). Safe floor — raising it makes lower-cap models `400` and burn a failover hop per request; only bump it if every model in your ladder supports a larger output window |
 | `PROXY_PRICING_JSON` | built-in table | JSON object of `{"<model-substring>": [in_per_1M, out_per_1M]}` (USD) used for the dashboard's estimated **money-saved** figure. Matched case-insensitively by substring, first hit wins. Overrides/extends the built-in per-family rates |
 | `PROXY_PRICING_DEFAULT` | `0.50,1.50` | `in,out` USD per 1M tokens for models not matched by the pricing table |
