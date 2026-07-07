@@ -219,6 +219,7 @@ variables set defaults and infrastructure:
 | `LOCAL_MODEL` | `Qwen3-Coder-Next-80b-A3B:latest` | local model id |
 | `PROXY_LOCAL_FALLBACK` | `1` | set `0` to disable the local tail rung |
 | `PROXY_MODEL_TIMEOUT_S` | `90` | per-model read timeout before failing over |
+| `PROXY_MAX_TOKENS_DEFAULT` | `8192` | `max_tokens` used when the client sends none (a client value always wins). Safe floor — raising it makes lower-cap models `400` and burn a failover hop per request; only bump it if every model in your ladder supports a larger output window |
 | `REFINER_BASE_URL` / `REFINER_MODEL` | Ollama / `qwen3:4b` | prompt-refiner endpoint |
 | `PROXY_REFINER_ENABLE` | `1` | enable the `[refine]` prompt refiner |
 
