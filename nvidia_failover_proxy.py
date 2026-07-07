@@ -138,23 +138,37 @@ _DEFAULT_MAX_TOKENS = int(os.environ.get("PROXY_MAX_TOKENS_DEFAULT", "8192"))
 # NVIDIA NIM is free on a personal account, so every token this proxy serves is
 # spend AVOIDED at a commercial API. To estimate the savings we price each model
 # at a representative commercial rate (USD per 1M tokens, input / output) for the
-# same open-weight model at typical hosts (OpenRouter / Together / DeepInfra,
-# mid-2026). These are deliberately rough — the point is an order-of-magnitude
-# "money saved" figure, not an invoice. Matching is by case-insensitive substring
-# against the model id, first hit wins, so keep more-specific keys earlier.
+# same open-weight model at typical hosts (Together / DeepInfra / OpenRouter).
+# Rates below were checked against those hosts' published pricing in mid-2026 and
+# are a representative mid-point across them — the point is a defensible "money
+# saved" figure, not an invoice; providers vary and prices drift, so re-check or
+# override. Matching is by case-insensitive substring against the model id, first
+# hit wins, so keep more-specific keys earlier.
 # Override any entry (or add models) with PROXY_PRICING_JSON, e.g.
 #   PROXY_PRICING_JSON='{"kimi-k2": [0.6, 2.5], "my-model": [1.0, 3.0]}'
 # and the unmatched-model fallback with PROXY_PRICING_DEFAULT="in,out".
+# Sources (mid-2026): DeepInfra & Together pricing pages, pricepertoken.com,
+# artificialanalysis.ai. Kimi K2.6 ~0.75/3.50 (DeepInfra) .. 1.20/4.50 (Together);
+# GLM-5.2 ~1.00/3.20 (GLM-5.1 1.40/4.40, GLM-5 0.80/2.56); DeepSeek V4 Pro
+# 1.74/3.48, V3.1 0.60/1.70; Qwen3.x 0.20/1.00 (small) .. higher for 397B;
+# Nemotron Ultra 253B 0.60/1.80; MiniMax M3 0.30/1.20; Llama 3.3 70B ~0.88 flat,
+# Llama-4 Maverick ~0.20/0.60; Mistral Large ~2/6, Medium ~0.40/2.00.
 _MODEL_PRICING_DEFAULT: Dict[str, tuple] = {
-    "kimi-k2": (0.50, 2.00),
-    "moonshot": (0.50, 2.00),
-    "glm": (0.55, 2.19),
-    "deepseek": (0.55, 2.19),
-    "qwen": (0.30, 1.20),
-    "nemotron": (0.20, 0.60),
-    "llama": (0.20, 0.60),
-    "mistral": (0.30, 0.90),
-    "mixtral": (0.30, 0.90),
+    "kimi-k2": (0.80, 3.50),
+    "moonshot": (0.80, 3.50),
+    "glm": (1.00, 3.20),
+    "deepseek-v4-pro": (1.74, 3.48),
+    "deepseek-pro": (1.74, 3.48),
+    "deepseek": (0.60, 1.70),
+    "minimax": (0.30, 1.20),
+    "nemotron": (0.60, 1.80),
+    "qwen": (0.35, 1.40),
+    "mistral-large": (2.00, 6.00),
+    "mistral-medium": (0.40, 2.00),
+    "mistral": (0.40, 2.00),
+    "mixtral": (0.60, 0.60),
+    "llama-4": (0.20, 0.60),
+    "llama": (0.35, 0.80),
     "gpt-oss": (0.30, 1.20),
     "phi": (0.15, 0.45),
     "gemma": (0.15, 0.45),
