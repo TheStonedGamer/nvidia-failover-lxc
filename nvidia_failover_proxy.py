@@ -1303,6 +1303,18 @@ GUARD_DEGENERATE = os.environ.get("PROXY_GUARD_DEGENERATE", "1").lower() not in 
 # Chinese with Latin/code, which defeats run- or fraction-based thresholds.
 _CJK_MIN_CHARS = int(os.environ.get("PROXY_CJK_MIN_CHARS", "4"))
 
+# The other degenerate mode: an English (or any-language) repetition loop — a
+# short phrase emitted over and over ("all we have to do is all we have to do
+# is …") until it fills the output, sometimes ending in a canned refusal. Unlike
+# the CJK code-switch this has no foreign script to key off, so we detect the
+# structural signature: the tail of the output is a short unit repeated many
+# times back-to-back. Kept conservative so ordinary repeated words, list
+# bullets, code, or "----" rules don't trip it: it needs many consecutive
+# identical repeats of a short *alphanumeric-bearing* unit over a substantial run.
+_REP_MIN_REPEATS = int(os.environ.get("PROXY_REP_MIN_REPEATS", "8"))
+_REP_MAX_UNIT = int(os.environ.get("PROXY_REP_MAX_UNIT", "60"))
+_REP_MIN_RUN = int(os.environ.get("PROXY_REP_MIN_RUN", "80"))
+
 # Anti-hang watchdog. httpx's read timeout resets on *any* byte, so an upstream
 # that stalls after partial output while still trickling SSE keepalives (or that
 # goes silent under our per-read `read` timeout window) will hang the stream with
@@ -1353,6 +1365,69 @@ def _unexpected_cjk(text: str, body: dict) -> bool:
     return _cjk_count(text) >= _CJK_MIN_CHARS
 
 
+def _looping_tail(text: str) -> bool:
+    """True if `text` contains a short unit repeated many times back-to-back — the
+    classic degenerate loop (e.g. 'all we have to do is ' over and over, often
+    followed by a short coda / canned refusal).
+
+    Detects a periodic run *anywhere* in the trailing window (not just the very
+    end), so a loop followed by a few words of coda is still caught. For each
+    period p it finds the longest stretch where s[i]==s[i-p]; a run of L such
+    matches is a periodic block ~L/p+1 repeats long. Conservative by design: it
+    needs >= _REP_MIN_REPEATS repeats of a <= _REP_MAX_UNIT-char unit over a run
+    of >= _REP_MIN_RUN chars, and the repeated unit must carry an alphanumeric
+    char — so ordinary repeated words, list bullets, or "----"/"===="/"####"
+    rules don't trip it."""
+    if not GUARD_DEGENERATE:
+        return False
+    s = text or ""
+    if len(s) < _REP_MIN_RUN:
+        return False
+    w = s[-4000:]  # bound the work; a real loop shows up near the end
+    n = len(w)
+    need_run = (_REP_MIN_REPEATS - 1)  # matches needed = (repeats-1) * period
+    for p in range(1, _REP_MAX_UNIT + 1):
+        run = 0
+        for i in range(p, n):
+            if w[i] == w[i - p]:
+                run += 1
+                if run >= need_run * p and run + p >= _REP_MIN_RUN:
+                    seg = w[i - p + 1 : i + 1]
+                    if any(ch.isalnum() for ch in seg):
+                        return True
+            else:
+                run = 0
+    return False
+
+
+def _looping_suffix(text: str) -> bool:
+    """Cheap variant of _looping_tail for the per-delta streaming check: only
+    tests whether the *suffix* is periodic. During an active loop the coda hasn't
+    arrived yet, so the tail is pure repetition — this catches it early while the
+    inner loop bails in O(_REP_MAX_UNIT) on ordinary (non-periodic) text."""
+    if not GUARD_DEGENERATE:
+        return False
+    s = text or ""
+    if len(s) < _REP_MIN_RUN:
+        return False
+    tail = s[-2000:]
+    m = len(tail)
+    for unit in range(1, _REP_MAX_UNIT + 1):
+        if unit * _REP_MIN_REPEATS > m:
+            break
+        seg = tail[-unit:]
+        if len(seg.strip()) < 2 or not any(ch.isalnum() for ch in seg):
+            continue
+        reps = 1
+        pos = m - unit
+        while pos - unit >= 0 and tail[pos - unit : pos] == seg:
+            reps += 1
+            pos -= unit
+            if reps >= _REP_MIN_REPEATS and reps * unit >= _REP_MIN_RUN:
+                return True
+    return False
+
+
 def _delta_text(obj: dict) -> str:
     choices = obj.get("choices") or []
     if not choices:
@@ -1397,6 +1472,8 @@ def _degenerate_reason(text: str, finish_reason, body: dict):
         return "finish_reason=repetition"
     if _unexpected_cjk(text or "", body):
         return "unexpected CJK code-switch"
+    if _looping_tail(text or ""):
+        return "degenerate repetition loop"
     return None
 
 
@@ -3034,6 +3111,12 @@ async def _stream_cascade(body: dict, ladder: List[str], timeout: httpx.Timeout)
                         # forwarded, so the Chinese never reaches the client.
                         guard_cjk = GUARD_DEGENERATE and not _prompt_has_cjk(body)
                         cjk_total = 0
+                        # Mid-stream repetition guard: accumulate a bounded tail of
+                        # the streamed content and trip if it collapses into a
+                        # short phrase looping over and over (the English analogue
+                        # of the CJK drift). Same truncate-cleanly handling.
+                        guard_rep = GUARD_DEGENERATE
+                        rep_tail = ""
                         # Content-idle watchdog: the moment the last real content
                         # delta arrived. A fully-silent socket is already caught by
                         # httpx's read timeout; this catches the other hang, where
@@ -3049,6 +3132,7 @@ async def _stream_cascade(body: dict, ladder: List[str], timeout: httpx.Timeout)
                             ):
                                 raise _StreamStall()
                             drifted = False
+                            drift_reason = ""
                             if line.startswith("data:"):
                                 payload = line[5:].strip()
                                 if payload and payload != "[DONE]":
@@ -3075,20 +3159,36 @@ async def _stream_cascade(body: dict, ladder: List[str], timeout: httpx.Timeout)
                                                 )
                                                 if cjk_total >= _CJK_MIN_CHARS:
                                                     drifted = True
+                                                    drift_reason = (
+                                                        "unexpected CJK code-switch"
+                                                    )
+                                            if guard_rep and not drifted and _delta_has_content(obj):
+                                                rep_tail = (
+                                                    rep_tail + _delta_text(obj)
+                                                )[-2000:]
+                                                if _looping_suffix(rep_tail):
+                                                    drifted = True
+                                                    drift_reason = (
+                                                        "degenerate repetition loop"
+                                                    )
                                     except ValueError:
                                         pass
                             if committed and drifted:
-                                # Drifted into Chinese — stop WITHOUT emitting this
-                                # (CJK) chunk. Better a clean, truncated answer than
-                                # pages of CJK leaking to the client.
+                                # Degenerated (CJK code-switch or a repetition
+                                # loop) — stop WITHOUT emitting this chunk. Better a
+                                # clean, truncated answer than pages of garbage. Cool
+                                # the model so the sticky cursor rolls forward off it
+                                # instead of landing back on the looping model.
                                 stats.record_usage(
                                     model,
                                     _stream_usage or _estimate_usage(body, out_chars),
                                 )
                                 stats.record_success(model)
+                                cascade.cool(model, _CONNECT_COOLDOWN_S)
                                 print(
-                                    f"[proxy/stream] {model}: unexpected CJK "
-                                    f"code-switch mid-stream; truncating"
+                                    f"[proxy/stream] {model}: {drift_reason} "
+                                    f"mid-stream; truncating + cooling "
+                                    f"{_CONNECT_COOLDOWN_S}s"
                                 )
                                 yield b"data: [DONE]\n\n"
                                 return

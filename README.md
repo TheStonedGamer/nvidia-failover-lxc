@@ -228,6 +228,9 @@ variables set defaults and infrastructure:
 | `PROXY_PRICING_DEFAULT` | `0.50,1.50` | `in,out` USD per 1M tokens for models not matched by the pricing table |
 | `PROXY_GUARD_DEGENERATE` | `1` | fail over when a model degenerates — `finish_reason=repetition` or an unexpected **CJK code-switch** (e.g. kimi drifting into Chinese on long coding prompts). Streaming is truncated cleanly *before* the CJK reaches the client |
 | `PROXY_CJK_MIN_CHARS` | `4` | how many unexpected CJK chars (in a non-CJK prompt) count as a code-switch. Cumulative, not a run — kimi interleaves Chinese with Latin/code, which defeats run/fraction thresholds. Genuine CJK requests are never touched (guard keys off the prompt) |
+| `PROXY_REP_MIN_REPEATS` | `8` | minimum consecutive identical repeats of a short unit before a same-language **repetition loop** is flagged degenerate (fail over / truncate + cool the model). Conservative so ordinary repeated words don't trip it |
+| `PROXY_REP_MAX_UNIT` | `60` | longest repeating unit (chars) the repetition guard considers — a degenerate loop repeats a *short* phrase; longer legitimate structure is ignored |
+| `PROXY_REP_MIN_RUN` | `80` | minimum total length (chars) of the repeated run before it counts as a loop — the run must also carry at least one alphanumeric char, so `----`/`====`/`####` rules and whitespace runs are exempt |
 | `PROXY_FREQ_PENALTY_JSON` / `PROXY_FREQ_PENALTY_DEFAULT` | `{"kimi-k2":0.3}` / `0` | per-model / global `frequency_penalty` injected when the client sends none (mild repetition mitigation) |
 | `PROXY_RPM_LIMIT_FLOOR` / `PROXY_TPM_IN_LIMIT_FLOOR` / `PROXY_TPM_OUT_LIMIT_FLOOR` | `5` / `8000` / `2000` | floors under the *learned* rate-limit ceilings when deciding to skip a model. A 429 under low traffic (a quota, not a rate limit) would otherwise teach a ceiling so low the model is skipped forever |
 | `REFINER_BASE_URL` / `REFINER_MODEL` | Ollama / `qwen3:4b` | prompt-refiner endpoint |
