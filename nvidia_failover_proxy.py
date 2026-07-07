@@ -2102,6 +2102,31 @@ SET_SCRIPT = """<script>
   });
 
   var discData=null, discHave={};
+  // Namespace a model id lands in: "openai/gpt-5" -> "openai", "gemma4:12b" ->
+  // "gemma4", bare "phi4" -> "phi4". Used to group the flat model wall.
+  function mdlGroup(m){
+    var s=m.indexOf("/"); if(s>0) return m.slice(0,s);
+    var c=m.indexOf(":"); if(c>0) return m.slice(0,c);
+    return m;
+  }
+  function mdlChip(m){
+    var chip=document.createElement("span"); chip.className="mdlchip"+(discHave[m]?" have":"");
+    chip.appendChild(document.createTextNode(m));
+    if(!discHave[m]){
+      var add=document.createElement("button"); add.textContent="＋";
+      add.addEventListener("click",function(){ if(addLadderRow(m)){ discHave[m]=1; chip.className="mdlchip have"; add.remove(); say("added "+m+' — hit "Save order & toggles"'); } });
+      chip.appendChild(add);
+    }
+    return chip;
+  }
+  function addAllBtn(list,cls,label){
+    var addable=list.filter(function(m){ return !discHave[m]; });
+    if(!addable.length) return null;
+    var b=document.createElement("button"); b.type="button"; b.className=cls;
+    b.textContent="＋ add all "+addable.length+(label||" shown");
+    b.addEventListener("click",function(e){ e.preventDefault(); var n=0; addable.forEach(function(m){ if(addLadderRow(m)){ discHave[m]=1; n++; } }); say("added "+n+' model(s) — hit "Save order & toggles"'); renderDisc(); });
+    return b;
+  }
   function renderDisc(){
     var box=document.getElementById("discresult");
     if(!box||!discData) return;
@@ -2119,32 +2144,44 @@ SET_SCRIPT = """<script>
       if(sortMode==="name-asc") models.sort();
       else if(sortMode==="name-desc") models.sort().reverse();
       else if(sortMode==="new-first"){ models.sort(); models.reverse(); models.sort(function(a,b){ return (discHave[b]?1:0)-(discHave[a]?1:0); }); }
+      var hardErr=res.error && !(res.models&&res.models.length);
       // Hide a provider entirely when a filter excludes all of its models.
-      if(q && !models.length && !res.error) return;
+      if(q && !models.length && !hardErr) return;
       var det=document.createElement("details"); det.className="discprov"; det.open=true;
       var sum=document.createElement("summary");
       var total=(res.models||[]).length;
       var label=q?(models.length+"/"+total):(""+total);
-      sum.innerHTML=(ICONS[name]||"")+" <b>"+esc(name)+"</b> "+(res.error?('<span class="pvmeta">error: '+esc(res.error)+'</span>'):('<span class="pvmeta">'+label+' model(s)</span>'));
+      var meta;
+      if(hardErr){ meta='<span class="pvmeta pverr">error: '+esc(res.error)+'</span>'; }
+      else {
+        meta='<span class="pvmeta">'+label+' model(s)</span>';
+        if(res.stale) meta+=' <span class="pvmeta pvwarn">⚠ cached (refresh failed: '+esc(res.error||"")+')</span>';
+        else if(res.fallback==="static") meta+=' <span class="pvmeta pvwarn">⚠ static list (live discovery failed: '+esc(res.error||"")+')</span>';
+      }
+      sum.innerHTML=(ICONS[name]||"")+" <b>"+esc(name)+"</b> "+meta;
       det.appendChild(sum);
       var body=document.createElement("div"); body.className="discbody";
-      var addable=models.filter(function(m){ return !discHave[m]; });
-      if(addable.length>1){
-        var all=document.createElement("button"); all.type="button"; all.className="addall";
-        all.textContent="＋ add all "+addable.length+" shown";
-        all.addEventListener("click",function(){ var n=0; addable.forEach(function(m){ if(addLadderRow(m)){ discHave[m]=1; n++; } }); say("added "+n+' model(s) — hit "Save order & toggles"'); renderDisc(); });
-        body.appendChild(all);
+      var pAll=addAllBtn(models,"addall"," shown"); if(pAll) body.appendChild(pAll);
+      // Group by namespace. Skip the nesting when there'd only be one group.
+      var groups={}, order=[];
+      models.forEach(function(m){ var g=mdlGroup(m); if(!groups[g]){ groups[g]=[]; order.push(g); } groups[g].push(m); });
+      if(order.length<=1){
+        models.forEach(function(m){ body.appendChild(mdlChip(m)); });
+      } else {
+        order.sort();
+        order.forEach(function(g){
+          var list=groups[g];
+          var gd=document.createElement("details"); gd.className="discgrp"; gd.open=!!q;
+          var gs=document.createElement("summary");
+          var addableN=list.filter(function(m){ return !discHave[m]; }).length;
+          gs.innerHTML='<b>'+esc(g)+'</b> <span class="pvmeta">'+list.length+(addableN?"":" · all added")+'</span>';
+          gd.appendChild(gs);
+          var gb=document.createElement("div"); gb.className="discgrpbody";
+          var gAll=addAllBtn(list,"addall"," in "+esc(g)); if(gAll) gb.appendChild(gAll);
+          list.forEach(function(m){ gb.appendChild(mdlChip(m)); });
+          gd.appendChild(gb); body.appendChild(gd);
+        });
       }
-      models.forEach(function(m){
-        var chip=document.createElement("span"); chip.className="mdlchip"+(discHave[m]?" have":"");
-        chip.appendChild(document.createTextNode(m));
-        if(!discHave[m]){
-          var add=document.createElement("button"); add.textContent="＋";
-          add.addEventListener("click",function(){ if(addLadderRow(m)){ discHave[m]=1; chip.className="mdlchip have"; add.remove(); say("added "+m+' — hit "Save order & toggles"'); } });
-          chip.appendChild(add);
-        }
-        body.appendChild(chip);
-      });
       det.appendChild(body);
       box.appendChild(det);
     });
@@ -2356,19 +2393,27 @@ async def post_settings(request: Request):
     return JSONResponse({"ok": True, **(await asyncio.to_thread(_settings_view))})
 
 
+# Last successful discovery per provider name, so a transient blip on refresh
+# shows the previous list (flagged stale) instead of a bare error. NVIDIA also
+# has FRONTIER_MODELS as a floor so its models are always offerable.
+_DISCOVERY_CACHE: Dict[str, List[str]] = {}
+
+
 async def _fetch_model_ids(base_url: str, key: Optional[str]) -> dict:
     """GET {base_url}/models from an OpenAI-compatible endpoint.
 
-    Retries once on a transport/timeout error: hosts like NVIDIA publish several
-    A records, and if the first IP blackholes the SYN httpx can burn the whole
-    connect budget before trying the next — a fresh client on retry picks another
-    address, so a transient ConnectTimeout doesn't fail discovery outright."""
+    Retries a few times with backoff on a transport/timeout error: hosts like
+    NVIDIA publish several A records, and if the first IP blackholes the SYN
+    httpx can burn the whole connect budget before trying the next — a fresh
+    client on retry picks another address, so a transient ConnectError/-Timeout
+    doesn't fail discovery outright."""
     headers = {"Content-Type": "application/json"}
     if key:
         headers["Authorization"] = f"Bearer {key}"
     url = f"{base_url.rstrip('/')}/models"
     last: Optional[Exception] = None
-    for attempt in range(2):
+    attempts = 3
+    for attempt in range(attempts):
         try:
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(15.0, connect=10.0)
@@ -2384,7 +2429,9 @@ async def _fetch_model_ids(base_url: str, key: Optional[str]) -> dict:
             )
             return {"models": ids}
         except (httpx.TransportError, httpx.TimeoutException) as e:
-            last = e  # transient — try a fresh connection once more
+            last = e  # transient — fresh connection (new A-record) after a beat
+            if attempt < attempts - 1:
+                await asyncio.sleep(0.4 * (attempt + 1))
             continue
         except (httpx.HTTPError, ValueError, KeyError) as e:
             msg = str(e).strip() or type(e).__name__
@@ -2393,16 +2440,39 @@ async def _fetch_model_ids(base_url: str, key: Optional[str]) -> dict:
     return {"error": msg[:140]}
 
 
+def _is_nvidia_provider(name: str, base_url: str) -> bool:
+    return name.lower() == "nvidia" or "integrate.api.nvidia.com" in (base_url or "")
+
+
+async def _discover_provider(name: str, p: dict) -> dict:
+    """Fetch a provider's model ids, degrading gracefully when discovery fails:
+    reuse the last good list (flagged stale), and for NVIDIA fall back to the
+    static FRONTIER_MODELS floor so the panel is never empty on a ConnectError."""
+    base_url = p.get("base_url", "")
+    res = await _fetch_model_ids(base_url, p.get("api_key"))
+    if "error" not in res:
+        _DISCOVERY_CACHE[name] = res["models"]
+        return res
+    err = res["error"]
+    cached = _DISCOVERY_CACHE.get(name)
+    if cached:
+        return {"models": cached, "stale": True, "error": err}
+    if _is_nvidia_provider(name, base_url):
+        return {"models": sorted(FRONTIER_MODELS), "fallback": "static", "error": err}
+    return res
+
+
 @app.get("/_models/available")
 async def models_available():
     """Live-discover model ids from NVIDIA + each custom provider so the UI can
-    offer new models to add to the ladder."""
+    offer new models to add to the ladder. Providers are queried concurrently;
+    a failed provider degrades to its cached/static list instead of erroring."""
     in_ladder = set(_known_models())
-    providers = {}
-    for name, p in ladder_config.providers.items():
-        providers[name] = await _fetch_model_ids(
-            p.get("base_url", ""), p.get("api_key")
-        )
+    items = list(ladder_config.providers.items())
+    results = await asyncio.gather(
+        *(_discover_provider(name, p) for name, p in items)
+    )
+    providers = {name: res for (name, _), res in zip(items, results)}
     return JSONResponse({"in_ladder": sorted(in_ladder), "providers": providers})
 
 
@@ -2566,6 +2636,15 @@ details.discprov[open]>summary::before{{content:"\\25BE"}}
 details.discprov .pvmeta{{color:#8b95a5;font-size:12px;font-weight:400}}
 .discbody{{padding:4px 0 8px}}
 .discbody .addall{{display:inline-block;background:#155e2f !important;padding:3px 10px !important;font-size:12px;margin:3px 3px 6px}}
+details.discgrp{{border:1px solid #1c2029;border-radius:5px;margin:4px 0;padding:1px 8px;background:#0c0e12}}
+details.discgrp>summary{{cursor:pointer;padding:5px 2px;list-style:none;font-size:12px;display:flex;align-items:center;gap:6px}}
+details.discgrp>summary::-webkit-details-marker{{display:none}}
+details.discgrp>summary::before{{content:"\\25B8";color:#5b6472;margin-right:2px}}
+details.discgrp[open]>summary::before{{content:"\\25BE"}}
+details.discgrp>summary b{{font-family:ui-monospace,Consolas,monospace;color:#c8d0dc}}
+.discgrpbody{{padding:2px 0 6px}}
+.pvmeta.pverr{{color:#ef5350}}
+.pvmeta.pvwarn{{color:#ffb74d}}
 </style>
 <script>
 (function(){{
