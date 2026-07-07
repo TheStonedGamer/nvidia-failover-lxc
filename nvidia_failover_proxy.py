@@ -1090,9 +1090,9 @@ def _model_view() -> List[dict]:
     # Follow the user-defined failover order from the web UI so the metrics table
     # matches the config panel; disabled models are hidden; local tail stays last.
     local_model = cascade._local_model()
-    names = [m for m in _known_models() if ladder_config.is_enabled(m)] + (
-        [local_model] if local_model else []
-    )
+    names = [m for m in _known_models() if ladder_config.is_enabled(m)]
+    if local_model and local_model not in names:
+        names.append(local_model)
     for name in names:
         m = stats.models.get(name, {})
         until = cascade.model_until.get(name, 0.0)
