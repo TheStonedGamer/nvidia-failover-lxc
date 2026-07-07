@@ -126,6 +126,14 @@ _MODEL_COOLDOWN_S = 5 * 60  # sideline a 429'd model this long (or its retry-aft
 _CONNECT_COOLDOWN_S = 20
 _CONNECT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 
+# Default max_tokens when the client doesn't send one. NIM quirk: some models
+# return empty content unless max_tokens is set, so we must supply *something*.
+# 8192 is the safe floor — most frontier NIM models accept it; raising it higher
+# makes lower-cap models 400 and burn a failover hop on every request (measured:
+# kimi-k2.6 400s at 32768). Bump this only if every model in your ladder supports
+# a larger output window. A client-supplied max_tokens always wins.
+_DEFAULT_MAX_TOKENS = int(os.environ.get("PROXY_MAX_TOKENS_DEFAULT", "8192"))
+
 # Agent profile model IDs — same cloud ladder but inject a role system prompt.
 # OpenCode picks these up as separate models for multi-agent workflows.
 AGENT_ROLES = {
@@ -1044,7 +1052,8 @@ def _prep_body(body: dict, model: str) -> dict:
     out = dict(body)
     out["model"] = model
     # NIM quirk: some models return empty content unless max_tokens is set.
-    out.setdefault("max_tokens", 8192)
+    # Client-supplied value always wins; see _DEFAULT_MAX_TOKENS for the rationale.
+    out.setdefault("max_tokens", _DEFAULT_MAX_TOKENS)
     # Streaming: ask for a final usage chunk so we can track tokens per model.
     if out.get("stream"):
         so = dict(out.get("stream_options") or {})
