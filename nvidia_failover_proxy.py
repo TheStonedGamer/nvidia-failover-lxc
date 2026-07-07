@@ -677,6 +677,20 @@ class Cascade:
             return True
         return bool(LOCAL_ENABLE) and model == LOCAL_MODEL
 
+    def _rotate_to_cursor(self, base: List[str]) -> List[str]:
+        """Reorder `base` to start at the last-served ('sticky') model so requests
+        keep hitting the current model and only roll forward — wrapping around —
+        as models rate-limit, rather than restarting at the top of the ladder
+        every request. Models already passed sit at the tail, retried only after
+        a full cycle. No-op when disabled or the cursor isn't in the ladder."""
+        if not _STICKY_LADDER:
+            return base
+        cursor = stats.sticky_model()
+        if not cursor or cursor not in base:
+            return base
+        i = base.index(cursor)
+        return base[i:] + base[:i]
+
     def order(self, preferred: Optional[str]) -> List[str]:
         """Try `preferred` first (if it's a real, usable model), then cascade
         through the rest of the cloud ladder (skipping dead / cooling models),
@@ -696,7 +710,13 @@ class Cascade:
         # tail rung (if any) remains.
         base = ladder_config.active_ladder()
         if preferred and preferred not in SPECIAL_IDS and not self.is_local(preferred):
+            # Explicit model pick: start at that rung, fail over downward. An
+            # explicit choice always wins over the sticky cursor.
             base = [preferred] + [m for m in base if m != preferred]
+        else:
+            # Auto / special cloud modes: keep serving from the sticky cursor and
+            # roll forward as models rate-limit instead of resetting to the top.
+            base = self._rotate_to_cursor(base)
         cloud = [
             m
             for m in base
@@ -788,6 +808,10 @@ _TPM_OUT_LIMIT_FLOOR = float(os.environ.get("PROXY_TPM_OUT_LIMIT_FLOOR", "2000")
 # How long after a model last served real content the dashboard keeps the green
 # "currently serving" dot on it before falling back to the head-of-ladder guess.
 _SERVING_WINDOW_S = float(os.environ.get("PROXY_SERVING_WINDOW_S", "20"))
+# Sticky cascade: start each request at the model that last served and only roll
+# forward (wrapping) as models rate-limit, instead of restarting at the top of the
+# ladder every request. Set PROXY_STICKY_LADDER=0 to restore strict top-priority.
+_STICKY_LADDER = os.environ.get("PROXY_STICKY_LADDER", "1") not in ("0", "false", "no")
 
 
 class Stats:
@@ -818,6 +842,13 @@ class Stats:
         """Mark `model` as the one actively serving right now."""
         self._serving_model = model
         self._serving_at = time.time()
+
+    def sticky_model(self) -> Optional[str]:
+        """The last model that served real content — the cascade's sticky cursor.
+        Unlike current_serving() this has no time window: it persists until a
+        different model serves (or stats are reset), so the ladder stays put
+        between requests instead of resetting to the top."""
+        return self._serving_model
 
     def current_serving(self, now: float) -> Optional[str]:
         """The model serving within the last _SERVING_WINDOW_S seconds, else None
@@ -1438,7 +1469,13 @@ def _model_view() -> List[dict]:
     # model *currently serving* (updated live as requests are handled); when idle
     # it falls back to the first live rung — the one that serves the next request.
     serving = stats.current_serving(now)
-    active_seen = False
+    # When idle, the dot marks the model that would actually serve the next
+    # request — with the sticky cascade that's the current cursor, not the head
+    # of the ladder — so ask the cascade directly instead of guessing top-down.
+    idle_next = None
+    if serving is None:
+        _next = cascade.order(AUTO_MODEL)
+        idle_next = _next[0] if _next else None
     for name in names:
         m = stats.models.get(name, {})
         until = cascade.model_until.get(name, 0.0)
@@ -1454,9 +1491,7 @@ def _model_view() -> List[dict]:
         if serving is not None:
             is_active = name == serving
         else:
-            is_active = state == "live" and not active_seen
-            if is_active:
-                active_seen = True
+            is_active = name == idle_next
         rows.append(
             {
                 "model": name,

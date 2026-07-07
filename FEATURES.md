@@ -6,10 +6,17 @@ speaks the OpenAI chat API — at. Default port **5002**.
 
 ## Routing & failover
 
-- **Failover ladder cascade** — requests go to the first live model in the
-  ladder; on 429 / 404 / 410 / connect failure / timeout / empty completion /
-  degenerate output the *same request* transparently fails over to the next
-  rung. Works for streaming and non-streaming.
+- **Failover ladder cascade** — on 429 / 404 / 410 / connect failure / timeout /
+  empty completion / degenerate output the *same request* transparently fails
+  over to the next rung. Works for streaming and non-streaming.
+- **Sticky cursor** (`PROXY_STICKY_LADDER`, default on) — the cascade does **not**
+  restart at the top of the ladder every request. It keeps serving from the model
+  that last served and only rolls *forward* — wrapping around — as models
+  rate-limit, so load rotates through the ladder instead of hammering (and
+  re-probing) the head rung on every call. A model that just recovered isn't
+  jumped back to until the cursor cycles around to it. An **explicit** model id in
+  the request always overrides the cursor and starts the cascade at that rung.
+  Set `PROXY_STICKY_LADDER=0` for strict top-priority ordering.
 - **Special model ids**
   | id | behavior |
   |---|---|
