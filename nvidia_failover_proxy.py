@@ -1672,10 +1672,38 @@ def _mask_key(key: Optional[str]) -> str:
     return (key[:6] + "…" + key[-4:]) if len(key) > 12 else "•" * len(key)
 
 
+def _ollama_live_models() -> List[str]:
+    """Fetch model names from the Ollama native /api/tags endpoint.
+
+    Falls back to the provider's configured model list on any error so the
+    UI dropdown is never empty when Ollama is temporarily unreachable."""
+    p = ladder_config.providers.get("ollama", {})
+    base = p.get("base_url", "").rstrip("/v1").rstrip("/")
+    if not base:
+        return list(p.get("models", []))
+    try:
+        resp = httpx.get(f"{base}/api/tags", timeout=5.0)
+        if resp.status_code != 200:
+            return list(p.get("models", []))
+        data = resp.json()
+        names = sorted(
+            name
+            for m in data.get("models", [])
+            if isinstance(m, dict) and (name := m.get("name"))
+        )
+        return names or list(p.get("models", []))
+    except (httpx.RequestError, ValueError, KeyError):
+        return list(p.get("models", []))
+
+
 def _settings_view() -> dict:
     """Providers + key status + local tail config for the UI — never returns
-    raw keys."""
-    ollama_models = list(ladder_config.providers.get("ollama", {}).get("models", []))
+    raw keys.
+
+    The local tail model dropdown is populated from the Ollama native API so
+    the user can pick any model currently available in Ollama, not just the
+    ones pre-configured in the provider."""
+    ollama_models = _ollama_live_models()
     return {
         "providers": [
             {
