@@ -69,6 +69,7 @@ def resolve_api_key() -> Optional[str]:
     except OSError:
         return None
 
+
 # Curated frontier ladder — the top-tier flagship chat/reasoning models on the
 # NVIDIA hosted API, strongest first (verified present 2026-07-06 via /v1/models).
 # Any model that ever returns 404/410 is dropped automatically at runtime, so a
@@ -573,29 +574,35 @@ class Stats:
         self._last_save = 0.0
 
     def _m(self, model: str) -> dict:
-        return self.models.setdefault(
-            model,
-            {
-                "requests": 0,
-                "successes": 0,
-                "rate_limited": 0,
-                "errors": 0,
-                "last_429": 0.0,
-                "last_success": 0.0,
-                "retry_after_ewma": 0.0,
-                "limit_rpm": None,
-                "peak_rpm": 0,
-                "limit_tpm_in": None,
-                "limit_tpm_out": None,
-                "peak_tpm_in": 0,
-                "peak_tpm_out": 0,
-                "tokens_in": 0,
-                "tokens_out": 0,
-                "tokens_total": 0,
-                "last_in": 0,
-                "last_out": 0,
-            },
-        )
+        # setdefault returns the existing dict (from DB or prior calls) or the
+        # default.  Existing dicts may be missing newer fields (e.g.
+        # limit_tpm_in added in a later version), so patch any that are absent.
+        defaults = {
+            "requests": 0,
+            "successes": 0,
+            "rate_limited": 0,
+            "errors": 0,
+            "last_429": 0.0,
+            "last_success": 0.0,
+            "retry_after_ewma": 0.0,
+            "limit_rpm": None,
+            "peak_rpm": 0,
+            "limit_tpm_in": None,
+            "limit_tpm_out": None,
+            "peak_tpm_in": 0,
+            "peak_tpm_out": 0,
+            "tokens_in": 0,
+            "tokens_out": 0,
+            "tokens_total": 0,
+            "last_in": 0,
+            "last_out": 0,
+        }
+        m = self.models.setdefault(model, dict(defaults))
+        # Patch any keys the existing dict may be missing (legacy DB data).
+        for k, v in defaults.items():
+            if k not in m:
+                m[k] = v
+        return m
 
     def _rpm(self, model: str, now: float) -> int:
         w = self._recent.setdefault(model, [])
@@ -1302,7 +1309,10 @@ PROVIDER_PRESETS: List[Dict[str, str]] = [
     {"name": "openrouter", "base_url": "https://openrouter.ai/api/v1"},
     {"name": "mistral", "base_url": "https://api.mistral.ai/v1"},
     {"name": "deepseek", "base_url": "https://api.deepseek.com/v1"},
-    {"name": "google", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai"},
+    {
+        "name": "google",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+    },
     {"name": "xai", "base_url": "https://api.x.ai/v1"},
     {"name": "together", "base_url": "https://api.together.xyz/v1"},
 ]
@@ -1539,7 +1549,9 @@ async def post_config(request: Request):
     if order is not None and (
         not isinstance(order, list) or not all(isinstance(m, str) for m in order)
     ):
-        return JSONResponse({"error": "order must be a list of strings"}, status_code=400)
+        return JSONResponse(
+            {"error": "order must be a list of strings"}, status_code=400
+        )
     if disabled is not None and (
         not isinstance(disabled, list) or not all(isinstance(m, str) for m in disabled)
     ):
@@ -1577,7 +1589,11 @@ def _settings_view() -> dict:
             for name, p in ladder_config.providers.items()
         ],
         "presets": [
-            {"name": p["name"], "base_url": p["base_url"], "icon": provider_icon(p["name"])}
+            {
+                "name": p["name"],
+                "base_url": p["base_url"],
+                "icon": provider_icon(p["name"]),
+            }
             for p in PROVIDER_PRESETS
         ],
     }
@@ -1667,9 +1683,7 @@ async def models_available():
         providers[name] = await _fetch_model_ids(
             p.get("base_url", ""), p.get("api_key")
         )
-    return JSONResponse(
-        {"in_ladder": sorted(in_ladder), "providers": providers}
-    )
+    return JSONResponse({"in_ladder": sorted(in_ladder), "providers": providers})
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1754,9 +1768,9 @@ async def dashboard() -> str:
         checked = "" if m in ladder_config.disabled else "checked"
         cfg_items.append(
             f'<li class=cfgrow draggable=true data-model="{m}">'
-            f'<span class=grip>&#8942;&#8942;</span>'
-            f'<input type=checkbox class=tog {checked}>'
-            f'<span class=cfgname>{m}</span></li>'
+            f"<span class=grip>&#8942;&#8942;</span>"
+            f"<input type=checkbox class=tog {checked}>"
+            f"<span class=cfgname>{m}</span></li>"
         )
     cfg_html = "".join(cfg_items)
     html = f"""<!doctype html><html><head><meta charset=utf-8>
@@ -2244,7 +2258,16 @@ async def chat_completions(request: Request):
             if resp is None:
                 continue
             if resp.status_code == 200:
-                data = resp.json()
+                try:
+                    data = resp.json()
+                except ValueError:
+                    stats.record_error(model)
+                    body_preview = (await resp.aread())[:200]
+                    print(
+                        f"[proxy] {model}: non-JSON 200 response "
+                        f"({body_preview}); failing over"
+                    )
+                    continue
                 stats.record_usage(model, data.get("usage"))
                 if SKIP_EMPTY and not _resp_has_content(data):
                     stats.record_error(model)
@@ -2317,8 +2340,15 @@ async def _stream_cascade(body: dict, ladder: List[str], timeout: httpx.Timeout)
                         # chunks until we see real content/tool_calls: if the
                         # stream ends without any (an empty 200 completion),
                         # discard and fail over instead of emitting nothing.
+                        #
+                        # NOTE: NVIDIA may send the usage block in the first SSE
+                        # chunk (with role="assistant" delta) AND again in the
+                        # final chunk (with choices=[]).  We only record the
+                        # *last* occurrence to avoid double-counting
+                        # prompt_tokens.
                         buffered: List[bytes] = []
                         committed = not SKIP_EMPTY
+                        _stream_usage: Optional[dict] = None
                         async for line in resp.aiter_lines():
                             if line.startswith("data:"):
                                 payload = line[5:].strip()
@@ -2327,8 +2357,13 @@ async def _stream_cascade(body: dict, ladder: List[str], timeout: httpx.Timeout)
                                         obj = json.loads(payload)
                                         if isinstance(obj, dict):
                                             if obj.get("usage"):
-                                                stats.record_usage(model, obj["usage"])
-                                            if not committed and _delta_has_content(obj):
+                                                # Save — record once after the
+                                                # loop, using the last (most
+                                                # complete) occurrence.
+                                                _stream_usage = obj["usage"]
+                                            if not committed and _delta_has_content(
+                                                obj
+                                            ):
                                                 committed = True
                                     except ValueError:
                                         pass
@@ -2341,6 +2376,10 @@ async def _stream_cascade(body: dict, ladder: List[str], timeout: httpx.Timeout)
                                 client_sent = True
                             else:
                                 buffered.append(emit)
+                        # Record usage now — exactly once per stream, using the
+                        # last (most complete) usage block seen.
+                        if _stream_usage is not None:
+                            stats.record_usage(model, _stream_usage)
                         if committed:
                             stats.record_success(model)
                             print(f"[proxy/stream] served by {model}")
