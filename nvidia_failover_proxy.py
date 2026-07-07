@@ -710,10 +710,20 @@ class Stats:
         return None
 
     def is_near_limit(self, model: str) -> bool:
-        """True if model's current throughput is at/above the learned ceiling."""
+        """True if model's current throughput is at/above the learned ceiling.
+
+        Minimum RPM floor of 5: a learned limit lower than that is statistically
+        meaningless (a single low-traffic 429 is usually a TPM limit, not an RPM
+        ceiling). Without this floor a model with limit_rpm=1.5 gets skipped at
+        1.3 RPM → never receives traffic → never learns a better value → dead
+        forever."""
         # RPM check
         lim_rpm = self.models.get(model, {}).get("limit_rpm")
-        if lim_rpm is not None and self.live_rpm(model) >= lim_rpm * _THROTTLE_RATIO:
+        if (
+            lim_rpm is not None
+            and lim_rpm >= 5
+            and self.live_rpm(model) >= lim_rpm * _THROTTLE_RATIO
+        ):
             return True
         # TPM-in check
         lim_tpi = self.models.get(model, {}).get("limit_tpm_in")
@@ -755,7 +765,11 @@ class Stats:
         m["rate_limited"] += 1
         m["last_429"] = now
         rpm = self._rpm(model, now)
-        if rpm > 0:  # rpm at a 429 is at/above the real ceiling — learn toward it
+        # Only learn RPM limit when the observed rate is meaningful.
+        # A single low-traffic 429 (e.g. 1-2 RPM) is usually a TPM limit
+        # or a transient spike, not the actual RPM ceiling — learning it
+        # would permanently throttle the model at ~1 RPM.
+        if rpm >= 5:
             m["limit_rpm"] = (
                 rpm
                 if m["limit_rpm"] is None
@@ -2584,8 +2598,13 @@ async def _stream_cascade(body: dict, ladder: List[str], timeout: httpx.Timeout)
                         # Partial answer already delivered — can't cleanly restart
                         # on another model. End the stream so the client sees a
                         # finished (if truncated) message rather than corruption.
+                        # Cool the model briefly so the *next* request skips it
+                        # instead of retrying the same broken model and hitting
+                        # the same timeout. 60s is short enough that the user
+                        # doesn't feel the gap but long enough to avoid thrashing.
+                        cascade.cool(model, 60)
                         print(
-                            f"[proxy/stream] {model}: {type(e).__name__} mid-stream; ending cleanly"
+                            f"[proxy/stream] {model}: {type(e).__name__} mid-stream; cooling 60s; ending cleanly"
                         )
                         yield b"data: [DONE]\n\n"
                         return
