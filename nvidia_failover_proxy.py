@@ -241,6 +241,8 @@ class LadderConfig:
         # name -> {"base_url": str, "api_key": str, "models": [str, ...]}
         self.providers: Dict[str, dict] = {}
         self.nvidia_key: Optional[str] = None  # legacy override (migrated → provider)
+        # Selected local tail model (None = auto-pick first Ollama provider model).
+        self.local_tail: Optional[str] = None
         self.load()
 
     def load(self) -> None:
@@ -263,6 +265,8 @@ class LadderConfig:
                     self.providers = json.loads(kv["providers"])
                 if kv.get("nvidia_key"):
                     self.nvidia_key = kv["nvidia_key"]
+                if kv.get("local_tail"):
+                    self.local_tail = kv["local_tail"]
                 changed = self._migrate_nvidia_provider()
                 changed = self._seed_providers_from_env() or changed
                 if changed:
@@ -364,15 +368,15 @@ class LadderConfig:
             pass
 
     def _write(self, conn: sqlite3.Connection) -> None:
-        _kv_set(
-            conn,
-            {
-                "order": json.dumps(self.order),
-                "disabled": json.dumps(list(self.disabled)),
-                "providers": json.dumps(self.providers),
-                "nvidia_key": self.nvidia_key or "",
-            },
-        )
+        data: Dict[str, str] = {
+            "order": json.dumps(self.order),
+            "disabled": json.dumps(list(self.disabled)),
+            "providers": json.dumps(self.providers),
+            "nvidia_key": self.nvidia_key or "",
+        }
+        if self.local_tail:
+            data["local_tail"] = self.local_tail
+        _kv_set(conn, data)
 
     def save(self) -> None:
         try:
@@ -457,6 +461,11 @@ class LadderConfig:
             self.disabled -= gone
         self.save()
 
+    def set_local_tail(self, model: Optional[str]) -> None:
+        """Set the local tail model (None = auto from first Ollama model)."""
+        self.local_tail = model or None
+        self.save()
+
     def resolved_nvidia_key(self) -> Optional[str]:
         return self.nvidia_key or resolve_api_key()
 
@@ -478,7 +487,14 @@ class Cascade:
         self.dead: Set[str] = set()  # 404/410 — dropped permanently
 
     def _local_model(self) -> Optional[str]:
-        """First model from the Ollama provider, else legacy LOCAL_MODEL env."""
+        """First model from the Ollama provider, else legacy LOCAL_MODEL env.
+
+        If the user has set a specific local_tail in the config (via the web UI
+        dropdown), that model is used instead of the first Ollama provider model."""
+        # User-selected local tail (from UI dropdown) takes priority.
+        lt = ladder_config.local_tail
+        if lt:
+            return lt
         p = ladder_config.providers.get("ollama", {})
         models = p.get("models", [])
         if models:
@@ -1471,6 +1487,21 @@ SET_SCRIPT = """<script>
         li.appendChild(b); ul.appendChild(li);
       });
     }
+    // Local tail model dropdown — populate from ollama provider models.
+    var sel=document.getElementById("tailsel");
+    if(sel && d.local_tail){
+      sel.innerHTML="";
+      var opts=d.local_tail.options||[];
+      if(!opts.length){
+        var o=document.createElement("option"); o.textContent="(no Ollama models)"; o.disabled=true; sel.appendChild(o);
+      } else {
+        opts.forEach(function(m){
+          var o=document.createElement("option"); o.value=m; o.textContent=m;
+          if(m===d.local_tail.current) o.selected=true;
+          sel.appendChild(o);
+        });
+      }
+    }
   }
 
   function load(){ fetch("/_settings").then(function(r){return r.json();}).then(renderSettings).catch(function(){}); }
@@ -1496,6 +1527,16 @@ SET_SCRIPT = """<script>
         document.getElementById("pvname").value=""; document.getElementById("pvurl").value="";
         document.getElementById("pvkey").value=""; document.getElementById("pvmodels").value="";
       }
+    });
+  });
+
+  var ts=document.getElementById("tailsave");
+  if(ts) ts.addEventListener("click",function(){
+    var sel=document.getElementById("tailsel");
+    if(!sel) return;
+    var model=sel.value||"";
+    post({action:"set_local_tail",model:model}).then(function(d){
+      if(d&&!d.error) say("local tail model updated to: "+model);
     });
   });
 
@@ -1632,7 +1673,9 @@ def _mask_key(key: Optional[str]) -> str:
 
 
 def _settings_view() -> dict:
-    """Providers + key status for the UI — never returns raw keys."""
+    """Providers + key status + local tail config for the UI — never returns
+    raw keys."""
+    ollama_models = list(ladder_config.providers.get("ollama", {}).get("models", []))
     return {
         "providers": [
             {
@@ -1652,6 +1695,12 @@ def _settings_view() -> dict:
             }
             for p in PROVIDER_PRESETS
         ],
+        "local_tail": {
+            "current": ladder_config.local_tail or ollama_models[0]
+            if ollama_models
+            else None,
+            "options": ollama_models,
+        },
     }
 
 
@@ -1687,6 +1736,9 @@ async def post_settings(request: Request):
         ladder_config.add_provider(name, base_url, body.get("api_key") or "", models)
     elif action == "remove_provider":
         ladder_config.remove_provider((body.get("name") or "").strip())
+    elif action == "set_local_tail":
+        model = (body.get("model") or "").strip()
+        ladder_config.set_local_tail(model if model else None)
     else:
         return JSONResponse({"error": f"unknown action {action!r}"}, status_code=400)
     return JSONResponse({"ok": True, **_settings_view()})
@@ -1945,6 +1997,9 @@ src.onerror=function(){{
 <div class=setsec style="border-bottom:0"><div class=setlbl>Discover available models <button id=discbtn class=small>Refresh</button></div>
 <div id=disctools class=disctools style="display:none"><input id=discfilter placeholder="filter models…"><select id=discsort><option value="name-asc">sort: name A→Z</option><option value="name-desc">sort: name Z→A</option><option value="new-first">sort: not-yet-added first</option></select></div>
 <div id=discresult class=dim>Click Refresh to query each provider's /v1/models. Each provider collapses into its own dropdown; use the filter and sort to narrow things down, then click ＋ to add a model to the ladder.</div></div>
+<div class=setsec style="border-bottom:0"><div class=setlbl>Local tail model (Ollama fallback)</div>
+<div class=setrow><select id=tailsel class=tailselect style="background:#0f1115;border:1px solid #2a2f3a;border-radius:6px;color:#e6e6e6;padding:7px 10px;font:13px system-ui;flex:1 1 300px;cursor:pointer;min-width:200px"></select>
+<button id=tailsave class=small>Save</button></div></div>
 <span id=setstatus class=dim></span>
 </details>
 <table><thead><tr>
