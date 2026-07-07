@@ -2102,12 +2102,24 @@ SET_SCRIPT = """<script>
   });
 
   var discData=null, discHave={};
-  // Namespace a model id lands in: "openai/gpt-5" -> "openai", "gemma4:12b" ->
-  // "gemma4", bare "phi4" -> "phi4". Used to group the flat model wall.
-  function mdlGroup(m){
-    var s=m.indexOf("/"); if(s>0) return m.slice(0,s);
-    var c=m.indexOf(":"); if(c>0) return m.slice(0,c);
-    return m;
+  // Family a model id lands in, after any provider-wide prefix (e.g. Google's
+  // "models/") is stripped: vendor when there's a "/" ("openai/gpt-5"->"openai"),
+  // else the leading family token ("gemini-3.1-flash"->"gemini", "qwen3:30b"->
+  // "qwen", "phi4-mini"->"phi"). Every provider gets meaningful groups this way.
+  function firstSeg(m){ var i=m.indexOf("/"); return i>0?m.slice(0,i):null; }
+  function familyKey(s){
+    var sl=s.indexOf("/"); if(sl>0) return s.slice(0,sl);
+    var c=s.indexOf(":"); var base=c>0?s.slice(0,c):s;
+    var mt=base.match(/^[A-Za-z]+/);
+    return mt?mt[0]:base;
+  }
+  // If every id in a provider shares one leading "seg/" prefix, strip it so
+  // grouping keys off what varies (Google's ids are all under "models/").
+  function groupKeyer(models){
+    var segs={}, allSlash=true;
+    models.forEach(function(m){ var f=firstSeg(m); if(f===null) allSlash=false; else segs[f]=1; });
+    var ks=Object.keys(segs), strip=(allSlash&&ks.length===1)?(ks[0]+"/"):null;
+    return function(m){ var s=(strip&&m.indexOf(strip)===0)?m.slice(strip.length):m; return familyKey(s); };
   }
   function mdlChip(m){
     var chip=document.createElement("span"); chip.className="mdlchip"+(discHave[m]?" have":"");
@@ -2162,9 +2174,10 @@ SET_SCRIPT = """<script>
       det.appendChild(sum);
       var body=document.createElement("div"); body.className="discbody";
       var pAll=addAllBtn(models,"addall"," shown"); if(pAll) body.appendChild(pAll);
-      // Group by namespace. Skip the nesting when there'd only be one group.
+      // Group by family. Skip the nesting when there'd only be one group.
+      var keyOf=groupKeyer(models);
       var groups={}, order=[];
-      models.forEach(function(m){ var g=mdlGroup(m); if(!groups[g]){ groups[g]=[]; order.push(g); } groups[g].push(m); });
+      models.forEach(function(m){ var g=keyOf(m); if(!groups[g]){ groups[g]=[]; order.push(g); } groups[g].push(m); });
       if(order.length<=1){
         models.forEach(function(m){ body.appendChild(mdlChip(m)); });
       } else {
