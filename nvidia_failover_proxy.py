@@ -1310,7 +1310,7 @@ _CJK_MIN_CHARS = int(os.environ.get("PROXY_CJK_MIN_CHARS", "4"))
 # additionally track wall-clock time since the last *content-bearing* delta and
 # treat too long a gap as a stall: fail over if nothing was delivered yet, else
 # end the stream cleanly so the client isn't left waiting forever.
-_STREAM_STALL_S = float(os.environ.get("PROXY_STREAM_STALL_S", "30"))
+_STREAM_STALL_S = float(os.environ.get("PROXY_STREAM_STALL_S", "60"))
 
 
 class _StreamStall(Exception):

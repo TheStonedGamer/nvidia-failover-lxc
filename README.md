@@ -220,7 +220,7 @@ variables set defaults and infrastructure:
 | `LOCAL_MODEL` | `Qwen3-Coder-Next-80b-A3B:latest` | local model id |
 | `PROXY_LOCAL_FALLBACK` | `1` | set `0` to disable the local tail rung |
 | `PROXY_MODEL_TIMEOUT_S` | `90` | per-model read timeout (fully silent socket) before failing over |
-| `PROXY_STREAM_STALL_S` | `30` | max gap with no new content tokens mid-stream before the stream is treated as hung — fails over if nothing was sent yet, else ends the stream cleanly. Only armed after the first token so slow-starting reasoning models aren't cut |
+| `PROXY_STREAM_STALL_S` | `60` | max gap with no new content tokens mid-stream before the stream is treated as hung — fails over if nothing was sent yet, else ends the stream cleanly. Only armed after the first token so slow-starting reasoning models aren't cut |
 | `PROXY_STICKY_LADDER` | `1` | keep serving from the model that last served and only roll forward (wrapping) through the ladder as models rate-limit, instead of restarting at the top of the ladder every request. Set `0` for strict top-priority ordering. An explicit model id in the request always overrides the cursor |
 | `PROXY_SERVING_WINDOW_S` | `20` | how long (seconds) after its last content delta a model still counts as "currently serving" for the dashboard's green dot before it falls back to marking the model that would serve the next request |
 | `PROXY_MAX_TOKENS_DEFAULT` | `8192` | `max_tokens` used when the client sends none (a client value always wins). Safe floor — raising it makes lower-cap models `400` and burn a failover hop per request; only bump it if every model in your ladder supports a larger output window |

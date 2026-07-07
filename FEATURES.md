@@ -66,7 +66,7 @@ speaks the OpenAI chat API — at. Default port **5002**.
 - **Mid-stream error handling** — once real bytes reached the client, an
   upstream error ends the SSE stream cleanly with `[DONE]` (truncated but
   coherent) instead of splicing a second model's answer on.
-- **Stall / hang watchdog** (`PROXY_STREAM_STALL_S`, default 30 s) — the classic
+- **Stall / hang watchdog** (`PROXY_STREAM_STALL_S`, default 60 s) — the classic
   "model just stops mid-output" failure. httpx's read timeout only catches a
   *fully silent* socket; an upstream that holds the stream open while trickling
   SSE keepalives but emits no more tokens would otherwise hang forever. The proxy
