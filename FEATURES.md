@@ -52,22 +52,21 @@ speaks the OpenAI chat API — at. Default port **5002**.
   instead of returning nothing (`PROXY_SKIP_EMPTY`). Streams buffer the leading
   chunks until real content appears, so an empty stream is discarded silently.
 - **Degenerate-output guard** (`PROXY_GUARD_DEGENERATE`) — catches the
-  kimi-k2.6 failure modes, both the Chinese code-switch **and** a plain
-  same-language repetition loop:
-  - non-stream: `finish_reason=repetition`, unexpected CJK, or a detected
-    repetition loop → fail over (and the model is briefly cooled).
-  - streaming: a cumulative CJK counter and a suffix repetition check are run
-    **before** each chunk is forwarded — the stream is truncated cleanly with
-    `[DONE]` and the model is cooled so the sticky cursor rolls forward off it
-    instead of landing back on the looping model.
-  - **CJK** guard keys off the *user/system prompt*: genuine
-    Chinese/Japanese/Korean requests are never touched, and degenerate
-    assistant history can't disarm it (`PROXY_CJK_MIN_CHARS`, default 4).
-  - **Repetition** guard trips only on a short unit (≤`PROXY_REP_MAX_UNIT`
-    chars, carrying at least one alphanumeric) repeated ≥`PROXY_REP_MIN_REPEATS`
-    times over ≥`PROXY_REP_MIN_RUN` chars — so a looping phrase like *"all we
-    have to do is all we have to do is…"* is caught, while ordinary repeated
-    words, list bullets, tables, and `----`/`====` rules are not.
+  kimi-k2.6 repetition-loop failure mode (a short phrase emitted over and over
+  until it fills the output, sometimes ending in a canned refusal):
+  - non-stream: `finish_reason=repetition` or a detected repetition loop → fail
+    over, and the model is briefly cooled.
+  - streaming: a suffix repetition check runs **before** each chunk is
+    forwarded — the stream is truncated cleanly with `[DONE]` and the model is
+    cooled so the sticky cursor rolls forward off it instead of landing back on
+    the looping model.
+  - Trips only on a short unit (≤`PROXY_REP_MAX_UNIT` chars, carrying at least
+    one alphanumeric) repeated ≥`PROXY_REP_MIN_REPEATS` times over
+    ≥`PROXY_REP_MIN_RUN` chars — so a looping phrase like *"all we have to do is
+    all we have to do is…"* is caught, while ordinary repeated words, list
+    bullets, tables, and `----`/`====` rules are not.
+  - *(An earlier CJK code-switch guard was removed — the models behave better
+    without it, and it risked touching genuine Chinese/Japanese/Korean output.)*
 - **Per-model frequency penalty** — a mild `frequency_penalty` is injected for
   models prone to loops (default `kimi-k2 → 0.3`); a client-supplied value
   always wins (`PROXY_FREQ_PENALTY_JSON`).

@@ -229,9 +229,8 @@ def _fmt_money(v: float) -> str:
 
 # --- Per-model repetition guard ----------------------------------------------
 # Some NIM models (notably moonshotai/kimi-k2.6) periodically fall into a
-# degenerate repetition loop on long "explain thoroughly" prompts and, once
-# looping, code-switch to Chinese — NIM surfaces this as finish_reason=repetition.
-# A mild frequency_penalty breaks the loop. We inject one ONLY for models that
+# degenerate repetition loop on long "explain thoroughly" prompts — NIM often
+# surfaces this as finish_reason=repetition. A mild frequency_penalty breaks it. We inject one ONLY for models that
 # need it, and ONLY when the client didn't send frequency_penalty (client wins).
 # Matched case-insensitively by substring; override with PROXY_FREQ_PENALTY_JSON,
 # e.g. PROXY_FREQ_PENALTY_JSON='{"kimi-k2":0.4,"some-model":0.3}'. A global
@@ -1290,27 +1289,18 @@ def _delta_has_content(obj: dict) -> bool:
 
 
 # --- Degenerate-output guard -------------------------------------------------
-# Detect the kimi-k2.6 (and similar) failure mode: a repetition loop that
-# code-switches to CJK. Used to fail over on the non-stream path and to abort a
-# fresh (not-yet-committed) stream before garbage reaches the client.
+# Detect the kimi-k2.6 (and similar) failure mode: a repetition loop — a short
+# phrase emitted over and over ("all we have to do is all we have to do is …")
+# until it fills the output, sometimes ending in a canned refusal. Used to fail
+# over on the non-stream path and to truncate a stream before pages of garbage
+# reach the client. (A prior CJK code-switch guard was removed — it worked
+# better without it.) We detect the structural signature: a short unit repeated
+# many times back-to-back. Kept conservative so ordinary repeated words, list
+# bullets, code, or "----" rules don't trip it: it needs many consecutive
+# identical repeats of a short *alphanumeric-bearing* unit over a substantial run.
 GUARD_DEGENERATE = os.environ.get("PROXY_GUARD_DEGENERATE", "1").lower() not in (
     "0", "false", "no", "",
 )
-# A degenerate model code-switches to CJK. We only guard when the *prompt* had
-# (essentially) no CJK, so genuine Chinese/Japanese/Korean requests are never
-# touched. In that case ANY meaningful amount of CJK in the answer is drift, so
-# we trip on a small absolute count rather than a fraction — kimi interleaves
-# Chinese with Latin/code, which defeats run- or fraction-based thresholds.
-_CJK_MIN_CHARS = int(os.environ.get("PROXY_CJK_MIN_CHARS", "4"))
-
-# The other degenerate mode: an English (or any-language) repetition loop — a
-# short phrase emitted over and over ("all we have to do is all we have to do
-# is …") until it fills the output, sometimes ending in a canned refusal. Unlike
-# the CJK code-switch this has no foreign script to key off, so we detect the
-# structural signature: the tail of the output is a short unit repeated many
-# times back-to-back. Kept conservative so ordinary repeated words, list
-# bullets, code, or "----" rules don't trip it: it needs many consecutive
-# identical repeats of a short *alphanumeric-bearing* unit over a substantial run.
 _REP_MIN_REPEATS = int(os.environ.get("PROXY_REP_MIN_REPEATS", "8"))
 _REP_MAX_UNIT = int(os.environ.get("PROXY_REP_MAX_UNIT", "60"))
 _REP_MIN_RUN = int(os.environ.get("PROXY_REP_MIN_RUN", "80"))
@@ -1327,42 +1317,6 @@ _STREAM_STALL_S = float(os.environ.get("PROXY_STREAM_STALL_S", "60"))
 
 class _StreamStall(Exception):
     """Raised when an upstream stream produces no new content for too long."""
-
-
-def _cjk_count(s: str) -> int:
-    # CJK Unified + common Japanese kana ranges; enough to catch a code-switch.
-    return sum(
-        1 for ch in s
-        if "一" <= ch <= "鿿"
-        or "぀" <= ch <= "ヿ"
-        or "가" <= ch <= "힣"
-    )
-
-
-def _prompt_has_cjk(body: dict) -> bool:
-    # Only user/system messages express the user's intent. Assistant history is
-    # excluded on purpose: a prior degenerate CJK reply in the conversation must
-    # not disarm the guard for every following turn.
-    for m in body.get("messages") or []:
-        if m.get("role") not in ("user", "system"):
-            continue
-        c = m.get("content")
-        if isinstance(c, str) and _cjk_count(c) >= 3:
-            return True
-        if isinstance(c, list):  # multimodal content parts
-            for part in c:
-                if isinstance(part, dict) and _cjk_count(part.get("text") or "") >= 3:
-                    return True
-    return False
-
-
-def _unexpected_cjk(text: str, body: dict) -> bool:
-    """True if the response is heavily CJK but the prompt wasn't (a code-switch)."""
-    if not text or _prompt_has_cjk(body):
-        return False
-    # Absolute count only: kimi interleaves Chinese with Latin/code when it
-    # degenerates, so a run- or fraction-based test lets large amounts through.
-    return _cjk_count(text) >= _CJK_MIN_CHARS
 
 
 def _looping_tail(text: str) -> bool:
@@ -1470,8 +1424,6 @@ def _degenerate_reason(text: str, finish_reason, body: dict):
         return None
     if finish_reason == "repetition":
         return "finish_reason=repetition"
-    if _unexpected_cjk(text or "", body):
-        return "unexpected CJK code-switch"
     if _looping_tail(text or ""):
         return "degenerate repetition loop"
     return None
@@ -1484,7 +1436,7 @@ def _prep_body(body: dict, model: str) -> dict:
     # Client-supplied value always wins; see _DEFAULT_MAX_TOKENS for the rationale.
     out.setdefault("max_tokens", _DEFAULT_MAX_TOKENS)
     # Repetition guard: inject a mild frequency_penalty for models prone to
-    # degenerate loops (e.g. kimi-k2.6 → Chinese). Client value always wins.
+    # degenerate loops (e.g. kimi-k2.6). Client value always wins.
     if "frequency_penalty" not in out:
         fp = _freq_penalty_for(model)
         if fp:
@@ -3104,17 +3056,10 @@ async def _stream_cascade(body: dict, ladder: List[str], timeout: httpx.Timeout)
                         committed = not SKIP_EMPTY
                         _stream_usage: Optional[dict] = None
                         out_chars = 0  # streamed content length, for usage fallback
-                        # Mid-stream code-switch guard: count unexpected CJK chars
-                        # cumulatively (a degenerate model drifting into Chinese)
-                        # and truncate cleanly the moment the count crosses the
-                        # threshold — checking *before* the offending chunk is
-                        # forwarded, so the Chinese never reaches the client.
-                        guard_cjk = GUARD_DEGENERATE and not _prompt_has_cjk(body)
-                        cjk_total = 0
                         # Mid-stream repetition guard: accumulate a bounded tail of
                         # the streamed content and trip if it collapses into a
-                        # short phrase looping over and over (the English analogue
-                        # of the CJK drift). Same truncate-cleanly handling.
+                        # short phrase looping over and over, then truncate cleanly
+                        # before pages of garbage reach the client.
                         guard_rep = GUARD_DEGENERATE
                         rep_tail = ""
                         # Content-idle watchdog: the moment the last real content
@@ -3153,16 +3098,7 @@ async def _stream_cascade(body: dict, ladder: List[str], timeout: httpx.Timeout)
                                                 committed = True
                                                 out_chars += len(_delta_text(obj))
                                                 stats.note_serving(model)
-                                            if guard_cjk:
-                                                cjk_total += _cjk_count(
-                                                    _delta_text(obj)
-                                                )
-                                                if cjk_total >= _CJK_MIN_CHARS:
-                                                    drifted = True
-                                                    drift_reason = (
-                                                        "unexpected CJK code-switch"
-                                                    )
-                                            if guard_rep and not drifted and _delta_has_content(obj):
+                                            if guard_rep and _delta_has_content(obj):
                                                 rep_tail = (
                                                     rep_tail + _delta_text(obj)
                                                 )[-2000:]
@@ -3174,11 +3110,11 @@ async def _stream_cascade(body: dict, ladder: List[str], timeout: httpx.Timeout)
                                     except ValueError:
                                         pass
                             if committed and drifted:
-                                # Degenerated (CJK code-switch or a repetition
-                                # loop) — stop WITHOUT emitting this chunk. Better a
-                                # clean, truncated answer than pages of garbage. Cool
-                                # the model so the sticky cursor rolls forward off it
-                                # instead of landing back on the looping model.
+                                # Degenerated into a repetition loop — stop WITHOUT
+                                # emitting this chunk. Better a clean, truncated
+                                # answer than pages of garbage. Cool the model so the
+                                # sticky cursor rolls forward off it instead of
+                                # landing back on the looping model.
                                 stats.record_usage(
                                     model,
                                     _stream_usage or _estimate_usage(body, out_chars),
