@@ -134,8 +134,11 @@ way. Disable with `PROXY_REFINER_ENABLE=0`.
   keys, and learned per-model stats; chmod 0600 including WAL sidecars. Legacy
   `proxy_config.json` / `proxy_stats.json` are imported once automatically.
 - **Token accounting** — `usage` blocks tracked per model for streaming
-  (`stream_options.include_usage` is injected) and non-streaming; the *last*
-  usage chunk wins so prompt tokens aren't double-counted.
+  (`stream_options.include_usage` is **forced on**, so a client that disables it
+  can't suppress recording) and non-streaming; the *last* usage chunk wins so
+  prompt tokens aren't double-counted. If an upstream serves content but omits
+  the usage block entirely, tokens are **estimated** from the prompt and streamed
+  text (~4 chars/token) so a served request never silently records zero.
 - **Endpoints** — `/v1/chat/completions`, `/v1/models`, `/health`, `/stats`
   (JSON), `/updates` (SSE), `/_config`, `/_settings`, `/_models/available`.
 

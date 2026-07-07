@@ -1283,6 +1283,35 @@ def _delta_text(obj: dict) -> str:
     return (choices[0].get("delta") or {}).get("content") or ""
 
 
+def _approx_tokens_from_chars(n: int) -> int:
+    """~4 chars/token heuristic — good enough for a money-saved estimate."""
+    return max(0, (n + 3) // 4)
+
+
+def _estimate_usage(body: dict, out_chars: int) -> dict:
+    """Fallback token counts for an upstream that served content but never sent
+    a `usage` block (some NIM models omit it even with include_usage). Rough, but
+    far better than recording zero. Flagged `estimated` for transparency; the
+    stats layer only reads the token fields."""
+    prompt_chars = 0
+    for m in body.get("messages", []) or []:
+        c = m.get("content")
+        if isinstance(c, str):
+            prompt_chars += len(c)
+        elif isinstance(c, list):
+            for part in c:
+                if isinstance(part, dict):
+                    prompt_chars += len(part.get("text") or "")
+    pin = _approx_tokens_from_chars(prompt_chars)
+    pout = _approx_tokens_from_chars(out_chars)
+    return {
+        "prompt_tokens": pin,
+        "completion_tokens": pout,
+        "total_tokens": pin + pout,
+        "estimated": True,
+    }
+
+
 def _degenerate_reason(text: str, finish_reason, body: dict):
     """Return a short reason string if this looks degenerate, else None."""
     if not GUARD_DEGENERATE:
@@ -1307,9 +1336,12 @@ def _prep_body(body: dict, model: str) -> dict:
         if fp:
             out["frequency_penalty"] = fp
     # Streaming: ask for a final usage chunk so we can track tokens per model.
+    # Force it on — a client that sends include_usage=false would otherwise
+    # suppress the usage frame and we'd record zero tokens for the request. The
+    # extra final chunk is harmless to well-behaved clients.
     if out.get("stream"):
         so = dict(out.get("stream_options") or {})
-        so.setdefault("include_usage", True)
+        so["include_usage"] = True
         out["stream_options"] = so
     return out
 
@@ -2757,7 +2789,15 @@ async def chat_completions(request: Request):
                         f"({body_preview}); failing over"
                     )
                     continue
-                stats.record_usage(model, data.get("usage"))
+                _usage = data.get("usage")
+                if not _usage and _resp_has_content(data):
+                    # Upstream omitted usage — estimate from the response text so
+                    # the request still records tokens instead of zero.
+                    _out = (
+                        (data.get("choices") or [{}])[0].get("message") or {}
+                    ).get("content") or ""
+                    _usage = _estimate_usage(body, len(_out))
+                stats.record_usage(model, _usage)
                 if SKIP_EMPTY and not _resp_has_content(data):
                     stats.record_error(model)
                     print(f"[proxy] {model}: empty completion; failing over")
@@ -2846,6 +2886,7 @@ async def _stream_cascade(body: dict, ladder: List[str], timeout: httpx.Timeout)
                         buffered: List[bytes] = []
                         committed = not SKIP_EMPTY
                         _stream_usage: Optional[dict] = None
+                        out_chars = 0  # streamed content length, for usage fallback
                         # Mid-stream code-switch guard: count unexpected CJK chars
                         # cumulatively (a degenerate model drifting into Chinese)
                         # and truncate cleanly the moment the count crosses the
@@ -2884,6 +2925,7 @@ async def _stream_cascade(body: dict, ladder: List[str], timeout: httpx.Timeout)
                                                 # idle watchdog and commit.
                                                 last_content = time.monotonic()
                                                 committed = True
+                                                out_chars += len(_delta_text(obj))
                                             if guard_cjk:
                                                 cjk_total += _cjk_count(
                                                     _delta_text(obj)
@@ -2896,8 +2938,10 @@ async def _stream_cascade(body: dict, ladder: List[str], timeout: httpx.Timeout)
                                 # Drifted into Chinese — stop WITHOUT emitting this
                                 # (CJK) chunk. Better a clean, truncated answer than
                                 # pages of CJK leaking to the client.
-                                if _stream_usage is not None:
-                                    stats.record_usage(model, _stream_usage)
+                                stats.record_usage(
+                                    model,
+                                    _stream_usage or _estimate_usage(body, out_chars),
+                                )
                                 stats.record_success(model)
                                 print(
                                     f"[proxy/stream] {model}: unexpected CJK "
@@ -2915,9 +2959,13 @@ async def _stream_cascade(body: dict, ladder: List[str], timeout: httpx.Timeout)
                             else:
                                 buffered.append(emit)
                         # Record usage now — exactly once per stream, using the
-                        # last (most complete) usage block seen.
-                        if _stream_usage is not None:
-                            stats.record_usage(model, _stream_usage)
+                        # last (most complete) usage block seen, or an estimate if
+                        # the upstream committed content but never sent one.
+                        usage = _stream_usage
+                        if usage is None and committed:
+                            usage = _estimate_usage(body, out_chars)
+                        if usage is not None:
+                            stats.record_usage(model, usage)
                         if committed:
                             stats.record_success(model)
                             print(f"[proxy/stream] served by {model}")
@@ -2933,8 +2981,9 @@ async def _stream_cascade(body: dict, ladder: List[str], timeout: httpx.Timeout)
                         # answer); record the partial and end cleanly so the client
                         # gets a finished — if truncated — message instead of an
                         # endless spinner.
-                        if _stream_usage is not None:
-                            stats.record_usage(model, _stream_usage)
+                        stats.record_usage(
+                            model, _stream_usage or _estimate_usage(body, out_chars)
+                        )
                         stats.record_success(model)
                         print(
                             f"[proxy/stream] {model}: stalled >{_STREAM_STALL_S:.0f}s "
