@@ -95,8 +95,14 @@ speaks the OpenAI chat API — at. Default port **5002**.
   (LIVE/COOLING/DEAD/LOCAL), availability countdown, requests, successes, 429s,
   live+peak RPM, learned RPM/TPM ceilings, live TPM in/out, learned cooldown,
   token totals, and estimated $ saved. Auto-reconnects; dims when offline.
-- **Green pulsing dot** on the active model — the first live rung, i.e. the
-  one that serves the next request.
+- **Green pulsing dot** — follows the model *currently serving* real content
+  (updated live as failover moves the request down the ladder;
+  `PROXY_SERVING_WINDOW_S`, default 20 s). When idle it falls back to marking the
+  first live rung, i.e. the one that would serve the next request.
+- **Toolbar** — **Reset cooldowns** clears all active cooldowns and permanent
+  (404/410) dead-marks so every rung is retried immediately; **Reset stats**
+  (with confirm) zeroes all counters, tokens, and learned rate limits
+  (`POST /_reset_cooldowns`, `POST /_reset_stats`).
 - **Money-saved estimate** — every token priced at a representative commercial
   rate for the same open-weight model (per-family table, substring-matched;
   `PROXY_PRICING_JSON` / `PROXY_PRICING_DEFAULT`). Shown per model, as a TOTAL

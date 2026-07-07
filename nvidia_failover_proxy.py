@@ -743,6 +743,15 @@ class Cascade:
             self.model_until.get(model, 0.0), time.time() + secs
         )
 
+    def reset_cooldowns(self) -> int:
+        """Clear every active cooldown and the permanent-dead set so all models
+        are immediately eligible again. Returns how many were cleared."""
+        now = time.time()
+        n = len([t for t in self.model_until.values() if t > now]) + len(self.dead)
+        self.model_until.clear()
+        self.dead.clear()
+        return n
+
     def note_status(self, model: str, status: int, retry_after: Optional[str]) -> None:
         if status == 429:
             stats.record_429(model, retry_after)
@@ -776,6 +785,9 @@ _THROTTLE_RATIO = 0.85
 _RPM_LIMIT_FLOOR = float(os.environ.get("PROXY_RPM_LIMIT_FLOOR", "5"))
 _TPM_IN_LIMIT_FLOOR = float(os.environ.get("PROXY_TPM_IN_LIMIT_FLOOR", "8000"))
 _TPM_OUT_LIMIT_FLOOR = float(os.environ.get("PROXY_TPM_OUT_LIMIT_FLOOR", "2000"))
+# How long after a model last served real content the dashboard keeps the green
+# "currently serving" dot on it before falling back to the head-of-ladder guess.
+_SERVING_WINDOW_S = float(os.environ.get("PROXY_SERVING_WINDOW_S", "20"))
 
 
 class Stats:
@@ -797,6 +809,40 @@ class Stats:
         self._recent_tok_in: Dict[str, List[tuple]] = {}
         self._recent_tok_out: Dict[str, List[tuple]] = {}
         self._last_save = 0.0
+        # The model that most recently served (or is streaming) real content —
+        # drives the dashboard's live "currently serving" green dot.
+        self._serving_model: Optional[str] = None
+        self._serving_at = 0.0
+
+    def note_serving(self, model: str) -> None:
+        """Mark `model` as the one actively serving right now."""
+        self._serving_model = model
+        self._serving_at = time.time()
+
+    def current_serving(self, now: float) -> Optional[str]:
+        """The model serving within the last _SERVING_WINDOW_S seconds, else None
+        (idle → the dashboard falls back to the head-of-ladder prediction)."""
+        if self._serving_model and now - self._serving_at <= _SERVING_WINDOW_S:
+            return self._serving_model
+        return None
+
+    def reset_all(self) -> None:
+        """Wipe all learned stats and counters (in memory + persisted)."""
+        self.models = {}
+        self._recent = {}
+        self._recent_tok_in = {}
+        self._recent_tok_out = {}
+        self._serving_model = None
+        self._serving_at = 0.0
+        try:
+            conn = _db()
+            try:
+                conn.execute("DELETE FROM stats")
+                conn.commit()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            pass
 
     def _m(self, model: str) -> dict:
         # setdefault returns the existing dict (from DB or prior calls) or the
@@ -1388,8 +1434,10 @@ def _model_view() -> List[dict]:
     names = [m for m in _known_models() if ladder_config.is_enabled(m)]
     if local_model and local_model not in names:
         names.append(local_model)
-    # The "active" model is the first live rung in ladder order — the one that
-    # serves the next request. Mark it so the dashboard can show a green dot.
+    # The green dot marks the "active" model. While traffic is flowing that's the
+    # model *currently serving* (updated live as requests are handled); when idle
+    # it falls back to the first live rung — the one that serves the next request.
+    serving = stats.current_serving(now)
     active_seen = False
     for name in names:
         m = stats.models.get(name, {})
@@ -1403,14 +1451,18 @@ def _model_view() -> List[dict]:
             state = "cooling"
         else:
             state = "live"
-        is_active = state == "live" and not active_seen
-        if is_active:
-            active_seen = True
+        if serving is not None:
+            is_active = name == serving
+        else:
+            is_active = state == "live" and not active_seen
+            if is_active:
+                active_seen = True
         rows.append(
             {
                 "model": name,
                 "state": state,
                 "active": is_active,
+                "serving_now": serving is not None and name == serving,
                 "cooling_s": cooling,
                 "requests": m.get("requests", 0),
                 "successes": m.get("successes", 0),
@@ -1547,7 +1599,7 @@ async def _live_tbody() -> str:
         tpo = f"{_fmt_tpm(r['live_tpm_out'])} <span class=dim>(peak {_fmt_tpm(r['peak_tpm_out'])})</span>"
         saved = f'<span class=save>{_fmt_money(r["saved_usd"])}</span>' if r["saved_usd"] else "—"
         trs.append(
-            f"<tr><td class=n>{i + 1}</td><td class=m>{_ACTIVE_DOT if r.get('active') else ''}{r['model']}</td><td>{badge}</td>"
+            f"<tr><td class=n>{i + 1}</td><td class=m>{_dot(r)}{r['model']}</td><td>{badge}</td>"
             f"<td>{avail}</td><td>{r['requests']}</td><td>{r['successes']}</td>"
             f"<td>{r['rate_limited']}</td><td>{r['live_rpm']} <span class=dim>(peak {r['peak_rpm']})</span></td>"
             f"<td>{limit_rpm}</td><td>{_fmt_ceiling(r['learned_limit_tpm_in'])}</td>"
@@ -1601,6 +1653,16 @@ def _fmt_num(n) -> str:
 
 # Pulsing green dot shown next to the active (head-of-ladder, live) model.
 _ACTIVE_DOT = '<span class="dot" title="active model — serves the next request"></span>'
+
+
+def _dot(row: dict) -> str:
+    """Green dot markup for a row: distinguishes the model serving right now from
+    the head-of-ladder model that will serve next when idle."""
+    if not row.get("active"):
+        return ""
+    if row.get("serving_now"):
+        return '<span class="dot serving" title="currently serving requests"></span>'
+    return _ACTIVE_DOT
 
 
 # Stylized green-on-black "eye" mark (NVIDIA brand colors, #76b900) — used as the
@@ -1759,6 +1821,22 @@ CFG_SCRIPT = """<script>
       .catch(function(){ st.textContent="save failed"; });
   });
   document.getElementById("cfgreset").addEventListener("click",function(){ location.reload(); });
+  var ts=document.getElementById("toolstatus");
+  function post(url,ok){ fetch(url,{method:"POST"})
+      .then(function(r){return r.json();})
+      .then(function(d){ ts.textContent=d.ok?ok(d):("error: "+(d.error||"?")); })
+      .catch(function(){ ts.textContent="request failed"; }); }
+  var rc=document.getElementById("rstcool");
+  if(rc) rc.addEventListener("click",function(){
+    ts.textContent="clearing cooldowns…";
+    post("/_reset_cooldowns",function(d){return "cooldowns cleared ("+d.cleared+" model(s) revived)";});
+  });
+  var rs=document.getElementById("rststats");
+  if(rs) rs.addEventListener("click",function(){
+    if(!confirm("Zero all counters, tokens, and learned rate limits? This cannot be undone.")) return;
+    ts.textContent="resetting stats…";
+    post("/_reset_stats",function(d){return "stats reset";});
+  });
 })();
 </script>"""
 
@@ -1992,6 +2070,26 @@ async def post_config(request: Request):
     )
 
 
+@app.post("/_reset_cooldowns")
+async def post_reset_cooldowns():
+    """Clear all active cooldowns and permanent-dead marks so every rung is tried again."""
+    try:
+        n = cascade.reset_cooldowns()
+    except Exception as e:  # pragma: no cover - defensive
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+    return JSONResponse({"ok": True, "cleared": n})
+
+
+@app.post("/_reset_stats")
+async def post_reset_stats():
+    """Zero all per-model counters, tokens, and learned rate limits."""
+    try:
+        stats.reset_all()
+    except Exception as e:  # pragma: no cover - defensive
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+    return JSONResponse({"ok": True})
+
+
 def _mask_key(key: Optional[str]) -> str:
     if not key:
         return ""
@@ -2213,7 +2311,7 @@ async def dashboard() -> str:
         tpo = f"{_fmt_tpm(r['live_tpm_out'])} <span class=dim>(peak {_fmt_tpm(r['peak_tpm_out'])})</span>"
         saved = f'<span class=save>{_fmt_money(r["saved_usd"])}</span>' if r["saved_usd"] else "—"
         trs.append(
-            f"<tr><td class=n>{i + 1}</td><td class=m>{_ACTIVE_DOT if r.get('active') else ''}{r['model']}</td><td>{badge}</td>"
+            f"<tr><td class=n>{i + 1}</td><td class=m>{_dot(r)}{r['model']}</td><td>{badge}</td>"
             f"<td>{avail}</td><td>{r['requests']}</td><td>{r['successes']}</td>"
             f"<td>{r['rate_limited']}</td><td>{r['live_rpm']} <span class=dim>(peak {r['peak_rpm']})</span></td>"
             f"<td>{limit_rpm}</td><td>{_fmt_ceiling(r['learned_limit_tpm_in'])}</td>"
@@ -2255,6 +2353,11 @@ tr.tot td{{border-top:2px solid #2a2f3a;font-weight:600;color:#c8cfda}}
 .save{{color:#76b900;font-weight:600;font-variant-numeric:tabular-nums}}
 .dot{{display:inline-block;width:8px;height:8px;border-radius:50%;background:#76b900;margin-right:7px;vertical-align:middle;box-shadow:0 0 0 0 rgba(118,185,0,.7);animation:pulse 1.8s infinite}}
 @keyframes pulse{{0%{{box-shadow:0 0 0 0 rgba(118,185,0,.6)}}70%{{box-shadow:0 0 0 6px rgba(118,185,0,0)}}100%{{box-shadow:0 0 0 0 rgba(118,185,0,0)}}}}
+.dot.serving{{animation:pulse .9s infinite}}
+.toolbar{{display:flex;gap:8px;align-items:center;margin:10px 0 4px}}
+.toolbar button{{background:#2a2f3a;color:#e6e6e6;border:1px solid #3a4150;border-radius:6px;padding:5px 12px;font:12px system-ui;cursor:pointer}}
+.toolbar button:hover{{border-color:#1565c0}}
+.toolbar button.danger:hover{{border-color:#c62828;background:#3a2020}}
 .hero{{display:inline-flex;align-items:baseline;gap:10px;margin:0 0 16px;padding:10px 16px;background:#141822;border:1px solid #233318;border-left:3px solid #76b900;border-radius:8px}}
 .hero .amt{{font-size:22px;font-weight:700;color:#76b900;font-variant-numeric:tabular-nums}}
 .hero .lbl{{color:#8b95a5;font-size:12px}}
@@ -2346,6 +2449,7 @@ src.onerror=function(){{
 <div class=sub>{f"<span class=ok>{prov_n} provider(s)</span>" if key_ok else "<span class=bad>no providers — add one in Providers &amp; API keys</span>"}
  · live updates via SSE · models: auto, only, refine (+local refiner), local-only, local-refine, agent-*<span id=timer style="margin-left:10px;color:#5b6472">0s</span></div>
 <div class=hero title="Estimated spend avoided vs. running the same tokens on a commercial API (NVIDIA NIM is free on a personal account). Rough per-model rates — tune with PROXY_PRICING_JSON."><span class=amt>{saved_hero}</span><span class=lbl>estimated saved vs. commercial API pricing</span></div>
+<div class=toolbar><button id=rstcool title="Clear every active cooldown and revive dead models so all rungs are eligible again">Reset cooldowns</button><button id=rststats class=danger title="Zero all counters, tokens, and learned rate limits">Reset stats</button><span id=toolstatus class=dim></span></div>
 <details id=cfgpanel><summary>&#9881; Failover ladder — drag to reorder, uncheck to disable</summary>
 <ul id=cfglist>{cfg_html}</ul>
 <div class=cfgbar><button id=cfgsave>Save order &amp; toggles</button><button id=cfgreset>Reload</button><span id=cfgstatus class=dim></span></div>
@@ -2811,6 +2915,7 @@ async def chat_completions(request: Request):
                     print(f"[proxy] {model}: {_deg}; failing over")
                     continue
                 stats.record_success(model)
+                stats.note_serving(model)  # drives the live "serving now" dot
                 data["_proxy_model"] = model  # trace which model actually served
                 print(f"[proxy] served by {model}")
                 return JSONResponse(data)
@@ -2922,10 +3027,13 @@ async def _stream_cascade(body: dict, ladder: List[str], timeout: httpx.Timeout)
                                                 _stream_usage = obj["usage"]
                                             if _delta_has_content(obj):
                                                 # Real token(s) landed — reset the
-                                                # idle watchdog and commit.
+                                                # idle watchdog, commit, and mark
+                                                # this model as the one serving now
+                                                # (drives the live green dot).
                                                 last_content = time.monotonic()
                                                 committed = True
                                                 out_chars += len(_delta_text(obj))
+                                                stats.note_serving(model)
                                             if guard_cjk:
                                                 cjk_total += _cjk_count(
                                                     _delta_text(obj)
