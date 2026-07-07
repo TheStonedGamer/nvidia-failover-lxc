@@ -1,0 +1,20 @@
+[project]
+name = "model-router"
+version = "0.1.0"
+description = "A self-improving hardware-aware local AI engineering platform"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2.0.0",
+    "httpx>=0.27.0",
+    "fastapi>=0.110.0",
+    "uvicorn>=0.29.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# The codebase imports `from src.…`, so ship the repo-root `src` package as-is.
+packages = ["src"]
