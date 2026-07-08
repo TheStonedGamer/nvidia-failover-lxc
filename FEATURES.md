@@ -1,8 +1,8 @@
 # Features
 
-Everything `nvidia_failover_proxy.py` does, in one place. It's a single-file,
-OpenAI-compatible proxy (FastAPI + httpx) you point OpenCode — or anything that
-speaks the OpenAI chat API — at. Default port **5002**.
+Everything this proxy does, in one place. It's a modular FastAPI + httpx
+OpenAI-compatible proxy you point OpenCode — or anything that speaks the
+OpenAI chat API — at. Default port **5002**.
 
 ## Routing & failover
 

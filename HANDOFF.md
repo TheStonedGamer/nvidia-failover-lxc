@@ -1,260 +1,116 @@
-# Handoff: Web UI for Failover Order + Model Toggle
+# Handoff: model-proxy (structural rewrite of nvidia-failover-proxy)
 
-> **Status:** In progress — Claude Code is picking this up.
-> **Date:** 2026-07-06
-> **Repo:** https://github.com/TheStonedGamer/nvidia-failover-lxc (branch `main`)
-
----
-
-## What we're building
-
-A web UI on the NVIDIA failover proxy dashboard that lets you:
-
-1. **Drag-and-drop reorder** the failover ladder (which cloud model is tried first, second, etc.)
-2. **Toggle individual models on/off** (disabled models are skipped entirely)
-3. **Persist** the config to `proxy_config.json` so it survives restarts
+> **Status:** Rewrite complete, tested, and deployed live.
+> **Date:** 2026-07-08
 
 ---
 
-## What's already DONE
+## What this is
 
-### GitHub repo
+`E:\Projects\model-router\nvidia_failover_proxy.py` was a working, deployed
+OpenAI-compatible failover proxy — but a single 3482-line file (routing, guards,
+SQLite persistence, stats, in-chat commands, and the entire dashboard all in one
+module). This repo, `model-proxy`, is a **behavior-identical rewrite** of that file
+into a normal FastAPI package (`app/`) — see [ARCHITECTURE.md](ARCHITECTURE.md) for
+the module map. No new features were added; feature parity was the bar (see the
+original plan, `imperative-waddling-whisper` in `~/.claude/plans/` if it still
+exists). Three real parity bugs were found and fixed during the port — see
+"Bugs fixed during the port" below.
 
-- Repo created at `https://github.com/TheStonedGamer/nvidia-failover-lxc`
-- Initial commit pushed (contain `deploy.sh`, `README.md`, a simplified proxy stub)
-- Remote `origin` → `https://github.com/TheStonedGamer/nvidia-failover-lxc.git` on branch `main`
-- Local repo dir: `E:\Projects\nvidia-failover-lxc\`
+## Current state
 
-### LXC container (Proxmox CT 3000, IP 10.0.0.199)
+- **Deployed and live** at CT 3000 (10.0.0.199:5002), replacing the old
+  `nvidia_failover_proxy.py` process. This is the proxy OpenCode and other clients
+  actually talk to right now.
+- 42 tests in `tests/`, all passing, run against fresh temp DBs (never the real one).
+- Verified against a **copy** of the real `proxy.db` before deploying (health,
+  stats, models, dashboard, SSE, slash commands, config round-trip all matched).
+- Verified live after deploying: `/health`, `/stats` (showed the pre-existing
+  historical counters intact), `/v1/models`, dashboard HTML, and a real
+  `/v1/chat/completions` request against NVIDIA all returned correct results with
+  usage recorded.
 
-- Container running, systemd service `nvidia-failover-proxy` is enabled + active
-- Proxy accessible at `http://10.0.0.199:5002/v1` (health endpoint returns `ok:true`)
-- Bound to `0.0.0.0:5002` (reachable from LAN)
-- Environment vars set in systemd unit: `NVIDIA_API_KEY`, `REFINER_BASE_URL`, `LOCAL_OLLAMA_URL`
-- Code deployed at `/root/model-router/nvidia_failover_proxy.py` + `/root/model-router/src/providers/nvidia.py`
-- Deploy commands:
-  ```powershell
-  scp E:\Projects\model-router\nvidia_failover_proxy.py root@10.0.0.98:/root/
-  ssh root@10.0.0.98 "pct push 3000 /root/nvidia_failover_proxy.py /root/model-router/nvidia_failover_proxy.py && pct exec 3000 -- systemctl restart nvidia-failover-proxy"
-  ssh root@10.0.0.98 "pct exec 3000 -- curl -s http://127.0.0.1:5002/health"
-  ```
+## Where things live on CT 3000
 
-### Proxy code (`E:\Projects\model-router\nvidia_failover_proxy.py` — the REAL working version, ~1500 lines)
+| What | Where |
+| --- | --- |
+| PVE host | `10.0.0.98` (`ssh root@10.0.0.98`) |
+| Container | CTID 3000, IP `10.0.0.199` |
+| **New install** | `/root/model-proxy/` — `app/`, `.venv/`, `requirements.txt`, `proxy.db` |
+| **Old install (kept for rollback)** | `/root/model-router/` — untouched, still has `nvidia_failover_proxy.py` + its own `proxy.db` copy from before the swap |
+| systemd unit | `/etc/systemd/system/nvidia-failover-proxy.service` — `ExecStart` now points at `/root/model-proxy/.venv/bin/python -m app.main`, `WorkingDirectory=/root/model-proxy` |
+| **Pre-swap unit backup** | `/etc/systemd/system/nvidia-failover-proxy.service.bak-pre-model-proxy` |
+| Drop-in | `/etc/systemd/system/nvidia-failover-proxy.service.d/maxtokens.conf` (`PROXY_MAX_TOKENS_DEFAULT=16384`) — unchanged, still applies |
 
-- `LadderConfig` class added at lines ~135–186 with:
-  - `order: List[str]` — user-defined failover order
-  - `disabled: Set[str]` — models toggled off
-  - `load()` / `save()` — atomic JSON persistence to `proxy_config.json`
-  - `update(order, disabled)` — update + persist in one call
-  - `active_ladder()` — returns enabled models in user-defined order
-- Global instance: `ladder_config = LadderConfig()` at line ~186
-- Config file path: `CONFIG_FILE = os.environ.get("PROXY_CONFIG_FILE", "proxy_config.json")`
+Env vars in the unit (`NVIDIA_API_KEY`, `REFINER_BASE_URL`, `LOCAL_OLLAMA_URL`,
+`PROXY_HOST=0.0.0.0`, `PROXY_MODEL_TIMEOUT_S=45`) were carried over unchanged.
 
-### OpenCode config
+## Rollback
 
-- `C:\Users\BrianTheMint\.config\opencode\opencode.jsonc` already points `nvidia-failover` provider at `http://10.0.0.199:5002/v1`
+If the new deployment misbehaves:
 
----
-
-## What's NOT done (pick up here)
-
-### 1. Wire `LadderConfig` into `Cascade.order()`
-
-In `E:\Projects\model-router\nvidia_failover_proxy.py`, find `Cascade.order()` at line ~203.
-
-Currently the base ladder is:
-
-```python
-base = list(self.models)  # line ~217
+```bash
+ssh root@10.0.0.98 "pct exec 3000 -- bash -c '\
+  cp /etc/systemd/system/nvidia-failover-proxy.service.bak-pre-model-proxy \
+     /etc/systemd/system/nvidia-failover-proxy.service && \
+  systemctl daemon-reload && systemctl restart nvidia-failover-proxy'"
 ```
 
-Change it to use the config-aware order:
+That points `ExecStart` back at `/root/model-router/nvidia_failover_proxy.py`. The
+old install's own `proxy.db` wasn't touched, so it resumes with its last known
+state (it will be missing anything served only through the new install in the
+interim).
 
-```python
-base = ladder_config.active_ladder()  # respects user order + disabled set
-if preferred and preferred not in SPECIAL_IDS and not self.is_local(preferred):
-    base = [preferred] + [m for m in base if m != preferred]
-cloud = [
-    m for m in base
-    if m not in self.dead
-    and now >= self.model_until.get(m, 0.0)
-    and not stats.is_near_limit(m)
-]
+## How to redeploy an update
+
+There's no `scripts/proxmox-lxc.sh` equivalent wired up for this repo yet (the one
+in `model-router/scripts/` targets the old single-file layout / `/opt/nvidia-failover`
+or `/root/model-router` paths — it doesn't know about `/root/model-proxy`). Until
+that's written, redeploy by hand:
+
+```bash
+# from E:\Projects\model-proxy
+tar --exclude="__pycache__" -cf /tmp/model-proxy-app.tar app requirements.txt
+scp /tmp/model-proxy-app.tar root@10.0.0.98:/root/
+ssh root@10.0.0.98 "pct push 3000 /root/model-proxy-app.tar /root/model-proxy-app.tar && \
+  pct exec 3000 -- bash -c 'cd /root/model-proxy && tar --no-same-owner -xf /root/model-proxy-app.tar && rm /root/model-proxy-app.tar && chown -R root:root . && .venv/bin/pip install -q -r requirements.txt && systemctl restart nvidia-failover-proxy'"
+ssh root@10.0.0.98 "pct exec 3000 -- curl -s http://127.0.0.1:5002/health"
 ```
 
-The dead/cooling/near-limit filters stay the same — just apply them to the config-aware base.
+`proxy.db` lives in `/root/model-proxy/` on the container and is **not** part of
+the tarball — don't overwrite it on redeploy.
 
-### 2. Add `/_config` API endpoints
+## Bugs fixed during the port (not in the original scope, but real deviations)
 
-Add these near the other `@app.get` endpoints (search for `@app.get("/health")`):
+Found by careful line-by-line comparison against the original source while writing
+`tests/test_cascade.py`, not by test failures:
 
-```python
-from fastapi import Body
+1. **Clock source mismatch** — an earlier draft of `app/cascade.py` used
+   `time.monotonic()` for `model_until` bookkeeping in `order()`,
+   `soonest_cooldown()`, and `cool()`. The original (and `dashboard.py`/
+   `commands.py`) all use `time.time()`. Fixed to `time.time()` everywhere.
+2. **Missing cooldown-extension guard** — `cool()` now does
+   `model_until[model] = max(existing, time.time() + secs)`, matching the
+   original: a fresh short cooldown must never shorten an existing longer one.
+3. **`reset_cooldowns()` return count** — now counts live (unexpired) cooldowns
+   plus dead-marked models, matching what the original reports to the dashboard
+   button, instead of just `len(model_until)`.
 
-@app.get("/_config")
-async def get_config() -> dict:
-    return {
-        "order": ladder_config.order,
-        "disabled": list(ladder_config.disabled),
-        "all_models": list(cascade.models),
-    }
+## What's genuinely different from the original
 
-@app.post("/_config")
-async def set_config(body: dict = Body(...)) -> dict:
-    valid = set(cascade.models)
-    order = [m for m in body.get("order", []) if m in valid]
-    # append any models missing from the submitted order
-    for m in cascade.models:
-        if m not in order:
-            order.append(m)
-    disabled = [m for m in body.get("disabled", []) if m in valid]
-    ladder_config.update(order=order, disabled=disabled)
-    return {"ok": True, "order": ladder_config.order, "disabled": list(ladder_config.disabled)}
-```
+Nothing behaviorally. Structurally: Jinja2 templates instead of inline Python
+f-string HTML building for the dashboard; `app/routes/commands.py`'s slash-command
+handler uses a synchronous `httpx.Client` (matching its sync call site in
+`chat.py`) instead of the original's `httpx.AsyncClient`; `/pick`'s model override
+is stored via `get_model_override()`/`set_model_override()` in `app/state.py`
+instead of a bare module-level `global`.
 
-### 3. Add drag-and-drop UI to the dashboard
+## If you need more detail
 
-In the `dashboard()` function (search `async def dashboard`), the HTML is a big f-string. The SSE handler swaps `<tbody>` innerHTML every 500ms, so the config bar must be **outside** the `<tbody>`.
-
-Add a config bar above the table:
-
-```html
-<div
-  id="config-bar"
-  style="margin-bottom:16px;padding:12px;background:#1a1e28;border-radius:8px"
->
-  <b>Failover Order</b> (drag to reorder, toggle to enable):
-  <div id="ladder-list"></div>
-  <button onclick="saveConfig()">Save Order</button>
-</div>
-```
-
-JavaScript (add to the existing `<script>` block):
-
-```javascript
-async function loadConfig() {
-  const r = await fetch("/_config");
-  const c = await r.json();
-  const el = document.getElementById("ladder-list");
-  el.innerHTML = c.order
-    .map(function (m, i) {
-      const checked = !c.disabled.includes(m) ? "checked" : "";
-      return (
-        '<div draggable=true style="padding:6px;margin:4px 0;background:#222;cursor:move;border-radius:4px"' +
-        ' ondragstart="drag(event,' +
-        i +
-        ')" ondrop="drop(event,' +
-        i +
-        ')" ondragover="event.preventDefault()">' +
-        "<input type=checkbox " +
-        checked +
-        ' data-model="' +
-        m +
-        '"> ' +
-        m +
-        "</div>"
-      );
-    })
-    .join("");
-}
-
-let dragIdx = null;
-function drag(e, i) {
-  dragIdx = i;
-}
-function drop(e, i) {
-  e.preventDefault();
-  const items = [...document.querySelectorAll("#ladder-list > div")];
-  const moved = items[dragIdx],
-    target = items[i];
-  if (dragIdx < i) target.parentNode.insertBefore(moved, target.nextSibling);
-  else target.parentNode.insertBefore(moved, target);
-  dragIdx = null;
-}
-
-async function saveConfig() {
-  const items = [...document.querySelectorAll("#ladder-list > div")];
-  const order = items.map(function (d) {
-    return d.querySelector("input").dataset.model;
-  });
-  const disabled = items
-    .filter(function (d) {
-      return !d.querySelector("input").checked;
-    })
-    .map(function (d) {
-      return d.querySelector("input").dataset.model;
-    });
-  await fetch("/_config", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ order: order, disabled: disabled }),
-  });
-  alert("Failover order saved!");
-}
-
-loadConfig();
-```
-
-### 4. Verify locally
-
-```powershell
-# Compile check
-E:\Projects\model-router\.venv\Scripts\python.exe -c "import py_compile; py_compile.compile('E:\\Projects\\model-router\\nvidia_failover_proxy.py', doraise=True); print('OK')"
-```
-
-### 5. Deploy to the LXC
-
-```powershell
-scp E:\Projects\model-router\nvidia_failover_proxy.py root@10.0.0.98:/root/
-ssh root@10.0.0.98 "pct push 3000 /root/nvidia_failover_proxy.py /root/model-router/nvidia_failover_proxy.py && pct exec 3000 -- systemctl restart nvidia-failover-proxy && sleep 3 && pct exec 3000 -- curl -s http://127.0.0.1:5002/health"
-ssh root@10.0.0.98 "pct exec 3000 -- curl -s http://127.0.0.1:5002/_config"
-```
-
-Verify:
-
-- `GET /_config` returns `{"order": [...all 15 models...], "disabled": []}`
-- Dashboard at `http://10.0.0.199:5002/` shows the config bar with draggable model rows
-- Drag a model, uncheck a model, click Save, refresh page — the order/toggle persists
-
-### 6. Push the real proxy to GitHub
-
-The repo at `E:\Projects\nvidia-failover-lxc\` currently has a simplified stub. Replace it with the real working proxy:
-
-```powershell
-# Copy the REAL proxy + src into the repo
-Copy-Item "E:\Projects\model-router\nvidia_failover_proxy.py" "E:\Projects\nvidia-failover-lxc\nvidia_failover_proxy.py" -Force
-Copy-Item "E:\Projects\model-router\src\providers" "E:\Projects\nvidia-failover-lxc\src\providers" -Recurse -Force
-
-Set-Location E:\Projects\nvidia-failover-lxc
-git add -A
-git commit -m "Add web UI for failover order + model toggle; replace stub with real proxy"
-git push
-```
-
----
-
-## Key files
-
-| File                                                    | Role                                                   |
-| ------------------------------------------------------- | ------------------------------------------------------ |
-| `E:\Projects\model-router\nvidia_failover_proxy.py`     | **Edit this** — the real working proxy (~1500 lines)   |
-| `E:\Projects\model-router\src\providers\nvidia.py`      | API key resolver                                       |
-| `E:\Projects\nvidia-failover-lxc\`                      | GitHub repo dir (push the real proxy here after edits) |
-| `C:\Users\BrianTheMint\.config\opencode\opencode.jsonc` | OpenCode config (already points to LXC)                |
-
-## Infrastructure
-
-| What             | Where                                                         |
-| ---------------- | ------------------------------------------------------------- |
-| Proxmox PVE host | `10.0.0.98` (root, SSH key auth via `ssh root@10.0.0.98`)     |
-| LXC container    | CTID 3000, IP `10.0.0.199`                                    |
-| Proxy service    | systemd `nvidia-failover-proxy` (enabled, auto-start on boot) |
-| Desktop Ollama   | `10.0.0.127:11434` (80B tail + qwen3:4b refiner)              |
-| Dashboard        | `http://10.0.0.199:5002/`                                     |
-
-## Gotchas
-
-- The SSE EventSource at `/updates` swaps `<tbody>` innerHTML every 500ms — the config bar MUST be outside the tbody or it gets overwritten.
-- `LadderConfig` was added to the proxy but is NOT yet wired into `Cascade.order()`. The `base = list(self.models)` line at ~217 needs to become `base = ladder_config.active_ladder()`.
-- The repo's `nvidia_failover_proxy.py` is a simplified stub — it needs to be REPLACED with the real one before pushing.
-- The container's `nvidia_failover_proxy.py` was modified with `sed` to bind `0.0.0.0` instead of `127.0.0.1`. After deploying the real proxy, you need to either set the `host="0.0.0.0"` in the file OR set `PROXY_HOST=0.0.0.0` (if you add that env var).
+- [ARCHITECTURE.md](ARCHITECTURE.md) — module map, request data flow, singleton
+  test-reload pattern.
+- [FEATURES.md](FEATURES.md) — full feature list.
+- [README.md](README.md) — install/config/usage.
+- `E:\Projects\model-router\HANDOFF.md` — an older, task-specific handoff from
+  when the ladder-config web UI was added to the original single-file proxy;
+  useful for pre-rewrite history, not for this codebase's structure.

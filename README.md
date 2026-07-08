@@ -19,6 +19,10 @@ it and get resilient, multi-provider inference behind a single endpoint.
 - **SQLite persistence** — provider config, API keys, and learned stats live in a single
   `proxy.db` (WAL, `chmod 600`).
 
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the module layout and how a request flows
+through the cascade, and [HANDOFF.md](HANDOFF.md) for this rewrite's history and
+where the live deployment lives.
+
 ---
 
 ## Quick start
@@ -59,7 +63,7 @@ providers, keys, and learned stats across upgrades.
 
 ```bash
 pip install -r requirements.txt
-PROXY_HOST=0.0.0.0 python nvidia_failover_proxy.py
+PROXY_HOST=0.0.0.0 python -m app.main
 # → http://0.0.0.0:5002/v1
 ```
 
@@ -134,7 +138,7 @@ The SQLite store (`proxy.db`) is written next to the executable unless you set
 
 ```bash
 pip install -r requirements.txt pyinstaller
-pyinstaller --onefile --name nvidia-failover-proxy --collect-submodules uvicorn nvidia_failover_proxy.py
+pyinstaller --onefile --name nvidia-failover-proxy --collect-submodules uvicorn --add-data "app/templates;app/templates" --add-data "app/static;app/static" -p . app/main.py
 # → dist/nvidia-failover-proxy
 ```
 

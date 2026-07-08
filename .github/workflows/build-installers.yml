@@ -10,7 +10,7 @@ on:
     branches: [main]
     tags: ["v*"]
     paths:
-      - "nvidia_failover_proxy.py"
+      - "app/**"
       - "requirements.txt"
       - "packaging/**"
       - ".github/workflows/build-installers.yml"
@@ -64,15 +64,19 @@ jobs:
         run: >
           pyinstaller --onefile --name nvidia-failover-proxy
           --collect-submodules uvicorn
+          --add-data "app/templates;app/templates"
+          --add-data "app/static;app/static"
           --icon packaging/icon.ico
-          nvidia_failover_proxy.py
+          -p . app/main.py
 
       - name: Build executable (Linux)
         if: runner.os == 'Linux'
         run: >
           pyinstaller --onefile --name nvidia-failover-proxy
           --collect-submodules uvicorn
-          nvidia_failover_proxy.py
+          --add-data "app/templates:app/templates"
+          --add-data "app/static:app/static"
+          -p . app/main.py
 
       # ---- Package: Windows installer (Inno Setup) --------------------------
       - name: Build Windows installer

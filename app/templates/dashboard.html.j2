@@ -1,0 +1,37 @@
+<!doctype html><html><head><meta charset=utf-8>
+<title>NVIDIA failover proxy — live updates</title>
+<link rel="icon" type="image/svg+xml" href="{{ nv_favicon }}">
+<link rel="stylesheet" href="/static/dashboard.css">
+</head><body>
+<h1>{{ nv_logo_svg|safe }}<span><span class=nvbrand>failover proxy</span> — live state <span class=connection style="font-size:10px">connecting...</span></span></h1>
+<div class=sub>{% if key_ok %}<span class=ok>{{ prov_n }} provider(s)</span>{% else %}<span class=bad>no providers — add one in Providers &amp; API keys</span>{% endif %}
+ · live updates via SSE · models: auto, only, refine (+local refiner), local-only, local-refine, agent-*<span id=timer style="margin-left:10px;color:#5b6472">0s</span></div>
+<div class=hero title="Estimated spend avoided vs. running the same tokens on a commercial API (NVIDIA NIM is free on a personal account). Rough per-model rates — tune with PROXY_PRICING_JSON."><span class=amt>{{ saved_hero }}</span><span class=lbl>estimated saved vs. commercial API pricing</span></div>
+<div class=toolbar><button id=rstcool title="Clear every active cooldown and revive dead models so all rungs are eligible again">Reset cooldowns</button><button id=rststats class=danger title="Zero all counters, tokens, and learned rate limits">Reset stats</button><span id=toolstatus class=dim></span></div>
+<details id=cfgpanel><summary>&#9881; Failover ladder — drag to reorder, uncheck to disable</summary>
+<ul id=cfglist>{{ cfg_html|safe }}</ul>
+<div class=cfgbar><button id=cfgsave>Save order &amp; toggles</button><button id=cfgreset>Reload</button><span id=cfgstatus class=dim></span></div>
+</details>
+<details id=setpanel><summary>&#128273; Providers &amp; API keys — add NVIDIA, OpenAI, Anthropic, Cerebras… or any OpenAI-compatible API</summary>
+<div class=setsec><div class=setlbl>Quick add a provider</div>
+<div id=presetrow class=presetrow></div></div>
+<div class=setsec><div class=setlbl>Providers</div>
+<ul id=provlist></ul>
+<div class=setgrid><input id=pvname placeholder="name (e.g. openrouter)"><input id=pvurl placeholder="base URL (…/v1)"><input id=pvkey type=password placeholder="API key"><input id=pvmodels placeholder="model ids, comma-separated"><button id=pvadd>Add / update provider</button></div></div>
+<div class=setsec style="border-bottom:0"><div class=setlbl>Discover available models <button id=discbtn class=small>Refresh</button></div>
+<div id=disctools class=disctools style="display:none"><input id=discfilter placeholder="filter models…"><select id=discsort><option value="name-asc">sort: name A→Z</option><option value="name-desc">sort: name Z→A</option><option value="new-first">sort: not-yet-added first</option></select></div>
+<div id=discresult class=dim>Click Refresh to query each provider's /v1/models. Each provider collapses into its own dropdown; use the filter and sort to narrow things down, then click ＋ to add a model to the ladder.</div></div>
+<div class=setsec style="border-bottom:0"><div class=setlbl>Local tail model (Ollama fallback)</div>
+<div class=setrow><select id=tailsel class=tailselect style="background:#0f1115;border:1px solid #2a2f3a;border-radius:6px;color:#e6e6e6;padding:7px 10px;font:13px system-ui;flex:1 1 300px;cursor:pointer;min-width:200px"></select>
+<button id=tailsave class=small>Save</button></div></div>
+<span id=setstatus class=dim></span>
+</details>
+<table><thead><tr>
+<th>#</th><th>model</th><th>state</th><th>available</th><th>req</th><th>ok</th>
+<th>429s</th><th>rpm now</th><th>learned RPM</th><th>learned TPM in</th><th>learned TPM out</th>
+<th class=num>TPM in now</th><th class=num>TPM out now</th><th>learned cooldown</th>
+<th class=num>tokens in</th><th class=num>tokens out</th><th class=num>tokens total</th>
+<th class=num title="Estimated spend avoided vs. commercial API pricing for the same tokens">$ saved</th>
+</tr></thead><tbody>{{ tbody_html|safe }}</tbody></table>
+<script src="/static/dashboard.js"></script>
+</body></html>

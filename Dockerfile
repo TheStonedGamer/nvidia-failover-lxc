@@ -13,8 +13,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # App code.
-COPY nvidia_failover_proxy.py .
-COPY src/ ./src/
+COPY app/ ./app/
 
 # Bind to all interfaces and keep the SQLite store on a mountable volume so
 # provider config + learned stats survive container restarts/upgrades.
@@ -27,4 +26,4 @@ EXPOSE 5002
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5002/health', timeout=4).status==200 else 1)"
 
-CMD ["python", "nvidia_failover_proxy.py"]
+CMD ["python", "-m", "app.main"]
