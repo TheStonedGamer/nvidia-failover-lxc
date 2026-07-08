@@ -25,6 +25,27 @@ def test_v1_models_lists_special_ids_and_ladder(app_modules):
     assert "local-only" in ids
 
 
+def test_v1_models_includes_individually_discovered_models(app_modules):
+    ladder_config = app_modules["app.ladder"].ladder_config
+    discovery = app_modules["app.discovery"]
+    ladder_config.add_provider("groq", base_url="https://api.groq.com/openai/v1", api_key="k")
+
+    async def fake_fetch(base_url, key):
+        if base_url.startswith("https://api.groq.com"):
+            return {"models": ["groq/individual-model"]}
+        return {"error": "network disabled in tests"}
+
+    discovery._fetch_model_ids = fake_fetch
+
+    client = _client(app_modules)
+    resp = client.get("/v1/models")
+    assert resp.status_code == 200
+    ids = [m["id"] for m in resp.json()["data"]]
+    assert "groq/individual-model" in ids
+    # The auto/cascade-driving ids are still present alongside it.
+    assert "nvidia-auto" in ids
+
+
 def test_stats_endpoint_returns_model_snapshot(app_modules):
     client = _client(app_modules)
     resp = client.get("/stats")

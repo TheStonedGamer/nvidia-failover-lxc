@@ -202,6 +202,15 @@ class LadderConfig:
         for name, p in self.providers.items():
             if model in (p.get("models") or []):
                 return p.get("base_url"), p.get("api_key")
+        # Not in the curated ladder — check the live-discovery cache so any
+        # individual model a provider offers is still routable by name, not
+        # just the ones explicitly added to the failover order.
+        from app.discovery import cached_provider_for
+
+        name = cached_provider_for(model)
+        if name and name in self.providers:
+            p = self.providers[name]
+            return p.get("base_url"), p.get("api_key")
         return None
 
     def resolved_nvidia_key(self) -> Optional[str]:

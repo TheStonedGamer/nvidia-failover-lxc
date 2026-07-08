@@ -21,6 +21,7 @@ def app_modules(tmp_path, monkeypatch):
     names = [
         "app.config",
         "app.db",
+        "app.discovery",
         "app.ladder",
         "app.stats",
         "app.cascade",
@@ -38,4 +39,12 @@ def app_modules(tmp_path, monkeypatch):
     mods = {}
     for name in names:
         mods[name] = importlib.import_module(name)
+
+    # No test should make a real network call. Individual tests that want to
+    # exercise discovery can monkeypatch discover_provider/_fetch_model_ids
+    # themselves with more specific stubs.
+    async def _no_network(base_url, key):
+        return {"error": "network disabled in tests"}
+
+    monkeypatch.setattr(mods["app.discovery"], "_fetch_model_ids", _no_network)
     return mods

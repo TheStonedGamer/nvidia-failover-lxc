@@ -1,19 +1,18 @@
-"""/v1/models plus provider model discovery (/_models/available)."""
+"""/v1/models plus provider model discovery (/_models/available). /v1/models
+exposes every individual model each configured provider actually offers
+(live-discovered, not just the curated failover ladder) alongside the
+aggregate "auto"/"only"/agent-role models that still drive the cascade."""
 
-import asyncio
-import time
-from typing import Dict, List
+from typing import List
 
-import httpx
 from fastapi import APIRouter
 
-from app.config import AUTO_MODEL, ONLY_MODEL, REFINER_MODEL_ID, LOCAL_ONLY, LOCAL_REFINE, AGENT_ROLES, FRONTIER_MODELS
+from app.config import AUTO_MODEL, ONLY_MODEL, REFINER_MODEL_ID, LOCAL_ONLY, LOCAL_REFINE, AGENT_ROLES
 from app.ladder import ladder_config
 from app.state import cascade
+from app.discovery import discover_all, all_discovered_models
 
 router = APIRouter()
-
-_DISCOVERY_CACHE: Dict[str, List[str]] = {}
 
 
 def _known_models() -> List[str]:
@@ -34,6 +33,12 @@ async def list_models():
     for m in _known_models():
         if m not in ids:
             ids.append(m)
+
+    await discover_all(ladder_config.providers)
+    for m in all_discovered_models():
+        if m not in ids:
+            ids.append(m)
+
     local = cascade._local_model()
     if local and local not in ids:
         ids.append(local)
@@ -55,51 +60,11 @@ def inject_agent_prompt(body: dict, model) -> dict:
     return out
 
 
-def _is_nvidia_provider(name: str, base_url: str) -> bool:
-    return name == "nvidia" or "integrate.api.nvidia.com" in (base_url or "")
-
-
-async def _fetch_model_ids(base_url: str, key: str) -> dict:
-    headers = {"Content-Type": "application/json"}
-    if key:
-        headers["Authorization"] = f"Bearer {key}"
-    last_err = None
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        for attempt in range(3):
-            try:
-                resp = await client.get(f"{base_url}/models", headers=headers)
-                resp.raise_for_status()
-                data = resp.json()
-                ids = [m.get("id") for m in data.get("data", []) if m.get("id")]
-                return {"models": ids}
-            except (httpx.TransportError, httpx.TimeoutException) as e:
-                last_err = e
-                await asyncio.sleep(0.4 * (attempt + 1))
-            except Exception as e:
-                return {"error": str(e)}
-    return {"error": str(last_err) if last_err else "unknown error"}
-
-
-async def _discover_provider(name: str, p: dict) -> dict:
-    result = await _fetch_model_ids(p.get("base_url", ""), p.get("api_key", ""))
-    if "error" in result:
-        cached = _DISCOVERY_CACHE.get(name)
-        if cached:
-            return {"models": cached, "stale": True}
-        if _is_nvidia_provider(name, p.get("base_url", "")):
-            return {"models": list(FRONTIER_MODELS), "fallback": "static"}
-        return result
-    _DISCOVERY_CACHE[name] = result["models"]
-    return result
-
-
 @router.get("/_models/available")
 async def models_available():
+    # Manually-triggered from the dashboard — always force a live check
+    # rather than serving the /v1/models throttle-cached result.
     providers = ladder_config.providers
-    names = list(providers.keys())
-    results = await asyncio.gather(*(_discover_provider(n, providers[n]) for n in names))
+    results = await discover_all(providers, force=True)
     in_ladder = set(_known_models())
-    out = {}
-    for name, result in zip(names, results):
-        out[name] = result
-    return {"in_ladder": sorted(in_ladder), "providers": out}
+    return {"in_ladder": sorted(in_ladder), "providers": results}

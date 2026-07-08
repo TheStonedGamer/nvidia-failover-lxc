@@ -20,6 +20,7 @@ from app.config import (
 )
 from app.ladder import ladder_config
 from app.stats import Stats
+from app.discovery import all_discovered_models
 
 
 class Cascade:
@@ -72,7 +73,10 @@ class Cascade:
                 return [local_model] if (LOCAL_ENABLE and local_model) else []
             elif preferred == REFINER_MODEL_ID:
                 pass
-            elif preferred in base:
+            elif preferred in base or preferred in all_discovered_models():
+                # Either a curated ladder model or one discovered live from a
+                # configured provider — try it first, then fall back through
+                # the normal cascade rather than erroring or ignoring the pick.
                 live = [preferred] + [m for m in self._rotate_to_cursor(base) if m != preferred]
                 live = [m for m in live if m not in self.dead]
                 if LOCAL_ENABLE and local_model:

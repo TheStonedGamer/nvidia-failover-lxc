@@ -45,6 +45,16 @@ def test_model_provider_lookup(app_modules):
     assert ladder_config.model_provider("unknown-model") is None
 
 
+def test_model_provider_falls_back_to_discovery_cache(app_modules):
+    ladder_config = app_modules["app.ladder"].ladder_config
+    discovery = app_modules["app.discovery"]
+    ladder_config.add_provider("mistral", base_url="https://api.mistral.ai/v1", api_key="mk")
+
+    # Not in the curated `models` list — only known via live discovery.
+    discovery._MODEL_PROVIDER["mistral-medium-not-in-ladder"] = "mistral"
+    assert ladder_config.model_provider("mistral-medium-not-in-ladder") == ("https://api.mistral.ai/v1", "mk")
+
+
 def test_set_local_tail(app_modules):
     ladder_config = app_modules["app.ladder"].ladder_config
     ladder_config.set_local_tail("qwen3:4b")

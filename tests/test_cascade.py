@@ -67,6 +67,17 @@ def test_preferred_known_model_moves_to_front(app_modules):
     assert ladder[0] == preferred
 
 
+def test_preferred_discovered_model_not_in_ladder_still_tried_first(app_modules):
+    cascade = _cascade(app_modules)
+    discovery = app_modules["app.discovery"]
+    discovery._DISCOVERY_CACHE["some-provider"] = ["provider/individual-model"]
+
+    ladder = cascade.order("provider/individual-model")
+    assert ladder[0] == "provider/individual-model"
+    # Falls back through the normal cascade after the direct pick.
+    assert set(cascade._serving_ladder()).issubset(set(ladder))
+
+
 def test_local_only_mode_returns_just_the_local_model(app_modules):
     cascade = _cascade(app_modules)
     from app.config import LOCAL_ONLY
