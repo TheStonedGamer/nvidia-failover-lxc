@@ -16,7 +16,7 @@ set -Eeuo pipefail
 APP="NVIDIA Failover Proxy"
 REPO_RAW="https://raw.githubusercontent.com/TheStonedGamer/nvidia-failover-lxc/main"
 REPO_TARBALL="https://github.com/TheStonedGamer/nvidia-failover-lxc/archive/refs/heads/main.tar.gz"
-TEMPLATE="debian-12-standard_12.7-1_amd64.tar.zst"
+TEMPLATE="debian-12-standard_12.12-1_amd64.tar.zst"
 PROXY_PORT=5002
 
 # --- pretty output ----------------------------------------------------------
@@ -183,12 +183,17 @@ echo
 msg_info "About to create CT ${BL}$CT_ID${CL} (${CT_HOSTNAME}) — ${CT_CORES} core / ${CT_RAM}MB / ${CT_DISK}GB on ${CT_STORAGE}"
 
 # --- template ---------------------------------------------------------------
+# Debian point releases roll off pveam's mirror over time; resolve the newest
+# debian-12-standard available rather than trusting the pinned default to
+# still exist upstream.
 if ! pveam list local 2>/dev/null | grep -q "$TEMPLATE"; then
-  msg_info "Downloading template $TEMPLATE"
   pveam update >/dev/null 2>&1 || true
+  LATEST="$(pveam available -section system 2>/dev/null | awk '{print $2}' | grep '^debian-12-standard_' | sort -V | tail -n1)"
+  [ -n "$LATEST" ] && TEMPLATE="$LATEST"
+  msg_info "Downloading template $TEMPLATE"
   pveam download local "$TEMPLATE" >/dev/null || die "template download failed"
 fi
-msg_ok "Template ready"
+msg_ok "Template ready ($TEMPLATE)"
 
 # --- create container -------------------------------------------------------
 if [ "$CT_NET" = "dhcp" ]; then
