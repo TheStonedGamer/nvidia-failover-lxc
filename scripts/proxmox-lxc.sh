@@ -132,9 +132,17 @@ for f in pathlib.Path(\"app\").rglob(\"*.py\"):
     || die "couldn't restart service (tried '$svc') — check: pct exec $ctid -- systemctl status $svc"
   msg_ok "Service '$svc' restarted"
 
-  sleep 4
   local ip; ip="$(pct exec "$ctid" -- hostname -I 2>/dev/null | awk '{print $1}')"
-  if pct exec "$ctid" -- curl -fsS --max-time 8 "http://127.0.0.1:${PROXY_PORT}/health" >/dev/null 2>&1; then
+  # Startup now warms live provider discovery before it reports ready, which
+  # can take longer than a single fixed sleep — retry instead of one-shot.
+  local ok=0 i
+  for i in 1 2 3 4 5 6; do
+    sleep 3
+    if pct exec "$ctid" -- curl -fsS --max-time 8 "http://127.0.0.1:${PROXY_PORT}/health" >/dev/null 2>&1; then
+      ok=1; break
+    fi
+  done
+  if [ "$ok" = "1" ]; then
     msg_ok "Health check passed"
   else
     msg_error "Health check did not pass — check: pct exec $ctid -- journalctl -u $svc -e"
@@ -280,9 +288,17 @@ pct exec "$CT_ID" -- systemctl enable -q --now nvidia-failover-proxy
 msg_ok "Service started"
 
 # --- verify -----------------------------------------------------------------
-sleep 4
 IP="$(pct exec "$CT_ID" -- hostname -I 2>/dev/null | awk '{print $1}')"
-if pct exec "$CT_ID" -- curl -fsS --max-time 8 "http://127.0.0.1:${PROXY_PORT}/health" >/dev/null 2>&1; then
+# Startup now warms live provider discovery before it reports ready, which
+# can take longer than a single fixed sleep — retry instead of one-shot.
+HEALTH_OK=0
+for _i in 1 2 3 4 5 6; do
+  sleep 3
+  if pct exec "$CT_ID" -- curl -fsS --max-time 8 "http://127.0.0.1:${PROXY_PORT}/health" >/dev/null 2>&1; then
+    HEALTH_OK=1; break
+  fi
+done
+if [ "$HEALTH_OK" = "1" ]; then
   msg_ok "Health check passed"
 else
   msg_error "Health check did not pass yet — check: pct exec $CT_ID -- journalctl -u nvidia-failover-proxy -e"
