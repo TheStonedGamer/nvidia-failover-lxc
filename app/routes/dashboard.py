@@ -125,7 +125,7 @@ def _model_view() -> List[dict]:
                 ),
                 "learned_cooldown_s": (
                     round(m["retry_after_ewma"], 1)
-                    if m.get("retry_after_ewma", 0) > 0
+                    if (m.get("retry_after_ewma") or 0) > 0
                     else None
                 ),
                 "tokens_in": m.get("tokens_in", 0),
