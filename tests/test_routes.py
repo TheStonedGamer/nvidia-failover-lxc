@@ -46,6 +46,31 @@ def test_v1_models_includes_individually_discovered_models(app_modules):
     assert "nvidia-auto" in ids
 
 
+def test_add_provider_settings_action_auto_populates_live_models(app_modules):
+    discovery = app_modules["app.discovery"]
+
+    async def fake_fetch(base_url, key):
+        if base_url == "https://api.groq.com/openai/v1":
+            return {"models": ["groq/live-model-a", "groq/live-model-b"]}
+        return {"error": "network disabled in tests"}
+
+    discovery._fetch_model_ids = fake_fetch
+
+    client = _client(app_modules)
+    resp = client.post(
+        "/_settings",
+        json={
+            "action": "add_provider",
+            "name": "groq",
+            "base_url": "https://api.groq.com/openai/v1",
+            "api_key": "k",
+        },
+    )
+    assert resp.status_code == 200
+    provider = next(p for p in resp.json()["providers"] if p["name"] == "groq")
+    assert set(provider["models"]) == {"groq/live-model-a", "groq/live-model-b"}
+
+
 def test_stats_endpoint_returns_model_snapshot(app_modules):
     client = _client(app_modules)
     resp = client.get("/stats")

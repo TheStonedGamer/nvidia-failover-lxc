@@ -7,11 +7,25 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from app.config import strip_v1
+from app.discovery import discover_provider
 from app.ladder import ladder_config
 from app.state import cascade, stats
 from app.routes.models import _known_models
 
 router = APIRouter()
+
+
+async def _populate_from_live_catalog(name: str) -> None:
+    """Immediately fetch and persist a provider's full model list, rather
+    than waiting on the next throttled /v1/models discovery pass to surface
+    what it offers."""
+    p = ladder_config.providers.get(name)
+    if not p:
+        return
+    result = await discover_provider(name, p)
+    discovered = result.get("models") or []
+    if discovered:
+        ladder_config.add_provider(name, models=discovered)
 
 
 @router.get("/_config")
@@ -111,6 +125,7 @@ async def post_settings(request: Request):
     if action == "set_nvidia_key":
         key = body.get("key", "")
         ladder_config.set_nvidia_key(key)
+        await _populate_from_live_catalog("nvidia")
     elif action == "add_provider":
         name = body.get("name", "").strip()
         if not name:
@@ -121,6 +136,7 @@ async def post_settings(request: Request):
             api_key=body.get("api_key", ""),
             models=body.get("models") or [],
         )
+        await _populate_from_live_catalog(name)
     elif action == "remove_provider":
         name = body.get("name", "").strip()
         ladder_config.remove_provider(name)
