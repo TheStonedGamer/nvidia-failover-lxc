@@ -15,6 +15,7 @@ set -Eeuo pipefail
 
 APP="NVIDIA Failover Proxy"
 REPO_RAW="https://raw.githubusercontent.com/TheStonedGamer/nvidia-failover-lxc/main"
+REPO_TARBALL="https://github.com/TheStonedGamer/nvidia-failover-lxc/archive/refs/heads/main.tar.gz"
 TEMPLATE="debian-12-standard_12.7-1_amd64.tar.zst"
 PROXY_PORT=5002
 
@@ -79,25 +80,47 @@ do_update() {
   pct start "$ctid" >/dev/null 2>&1 || true
 
   # Find where the proxy is installed (helper layout, else legacy deploy.sh).
+  # Recognizes both the current app/ package and the old single-file layout.
   local dir=""
-  for cand in /opt/nvidia-failover /root/model-router; do
-    if pct exec "$ctid" -- test -f "$cand/nvidia_failover_proxy.py"; then dir="$cand"; break; fi
+  for cand in /opt/nvidia-failover /root/model-proxy /root/model-router; do
+    if pct exec "$ctid" -- test -f "$cand/app/main.py" || pct exec "$ctid" -- test -f "$cand/nvidia_failover_proxy.py"; then
+      dir="$cand"; break
+    fi
   done
-  [ -n "$dir" ] || die "couldn't find nvidia_failover_proxy.py in CT $ctid (looked in /opt/nvidia-failover, /root/model-router)"
+  [ -n "$dir" ] || die "couldn't find the proxy in CT $ctid (looked in /opt/nvidia-failover, /root/model-proxy, /root/model-router)"
   msg_info "Updating CT ${BL}$ctid${CL} at ${dir}"
 
-  # Back up the current file, fetch the latest, refresh deps if a venv exists.
+  # Back up the current install (whole dir, minus venv/db), fetch the latest
+  # app/ tree from the repo tarball, refresh deps if a venv exists, syntax-check
+  # every fetched module before we bounce the service; roll back on failure.
   pct exec "$ctid" -- bash -c "
     set -e
     cd '$dir'
-    cp nvidia_failover_proxy.py nvidia_failover_proxy.py.bak 2>/dev/null || true
-    curl -fsSL '${REPO_RAW}/nvidia_failover_proxy.py' -o nvidia_failover_proxy.py
-    curl -fsSL '${REPO_RAW}/requirements.txt' -o requirements.txt 2>/dev/null || true
+    rm -rf .update-bak && mkdir -p .update-bak
+    [ -d app ] && cp -a app .update-bak/ || true
+    [ -f nvidia_failover_proxy.py ] && cp -a nvidia_failover_proxy.py .update-bak/ || true
+    [ -f requirements.txt ] && cp -a requirements.txt .update-bak/ || true
+
+    tmp=\$(mktemp -d)
+    curl -fsSL '${REPO_TARBALL}' -o \"\$tmp/repo.tar.gz\"
+    tar -xzf \"\$tmp/repo.tar.gz\" -C \"\$tmp\"
+    src=\"\$(find \"\$tmp\" -maxdepth 1 -mindepth 1 -type d | head -n1)\"
+    rm -rf app
+    cp -a \"\$src/app\" app
+    cp -a \"\$src/requirements.txt\" requirements.txt
+    rm -f nvidia_failover_proxy.py
+    rm -rf \"\$tmp\"
+
     if [ -x .venv/bin/pip ]; then .venv/bin/pip install -q -r requirements.txt || true; fi
-    # Syntax-check before we bounce the service; roll back on failure.
+    # Syntax-check every fetched module before we bounce the service; roll back on failure.
     PY=.venv/bin/python; [ -x \"\$PY\" ] || PY=python3
-    if ! \$PY -c 'import ast,sys; ast.parse(open(\"nvidia_failover_proxy.py\",encoding=\"utf-8\").read())'; then
-      echo 'SYNTAX_FAIL'; mv -f nvidia_failover_proxy.py.bak nvidia_failover_proxy.py 2>/dev/null || true; exit 1
+    if ! \$PY -c 'import ast,sys,pathlib
+for f in pathlib.Path(\"app\").rglob(\"*.py\"):
+    ast.parse(f.read_text(encoding=\"utf-8\"))'; then
+      echo 'SYNTAX_FAIL'
+      rm -rf app; [ -d .update-bak/app ] && cp -a .update-bak/app app || true
+      [ -f .update-bak/nvidia_failover_proxy.py ] && cp -a .update-bak/nvidia_failover_proxy.py nvidia_failover_proxy.py || true
+      exit 1
     fi
   " || die "update failed (code fetched did not parse; rolled back)"
   msg_ok "Code updated"
@@ -119,7 +142,7 @@ do_update() {
   echo
   msg_ok "${APP} updated"
   echo -e "   Dashboard : ${BL}http://${ip}:${PROXY_PORT}/${CL}"
-  echo -e "   Rollback  : ${YW}pct exec $ctid -- bash -c 'cd $dir && mv -f nvidia_failover_proxy.py.bak nvidia_failover_proxy.py && systemctl restart $svc'${CL}"
+  echo -e "   Rollback  : ${YW}pct exec $ctid -- bash -c 'cd $dir && rm -rf app && cp -a .update-bak/app app && systemctl restart $svc'${CL}"
   exit 0
 }
 
@@ -201,8 +224,13 @@ pct exec "$CT_ID" -- bash -c "
   set -e
   mkdir -p /opt/nvidia-failover
   cd /opt/nvidia-failover
-  curl -fsSL '${REPO_RAW}/nvidia_failover_proxy.py' -o nvidia_failover_proxy.py
-  curl -fsSL '${REPO_RAW}/requirements.txt' -o requirements.txt
+  tmp=\$(mktemp -d)
+  curl -fsSL '${REPO_TARBALL}' -o \"\$tmp/repo.tar.gz\"
+  tar -xzf \"\$tmp/repo.tar.gz\" -C \"\$tmp\"
+  src=\"\$(find \"\$tmp\" -maxdepth 1 -mindepth 1 -type d | head -n1)\"
+  cp -a \"\$src/app\" app
+  cp -a \"\$src/requirements.txt\" requirements.txt
+  rm -rf \"\$tmp\"
   python3 -m venv .venv
   ./.venv/bin/pip install -q --upgrade pip
   ./.venv/bin/pip install -q -r requirements.txt
@@ -231,7 +259,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/opt/nvidia-failover
 EnvironmentFile=/opt/nvidia-failover/proxy.env
-ExecStart=/opt/nvidia-failover/.venv/bin/python /opt/nvidia-failover/nvidia_failover_proxy.py
+ExecStart=/opt/nvidia-failover/.venv/bin/python -m app.main
 Restart=always
 RestartSec=5
 # Keep restarts snappy — the SSE dashboard connections drain on disconnect, but
@@ -260,5 +288,5 @@ msg_ok "${APP} is ready"
 echo -e "   Dashboard : ${BL}http://${IP}:${PROXY_PORT}/${CL}"
 echo -e "   API base  : ${BL}http://${IP}:${PROXY_PORT}/v1${CL}"
 echo -e "   Logs      : ${YW}pct exec ${CT_ID} -- journalctl -u nvidia-failover-proxy -f${CL}"
-echo -e "   Update    : re-run this script's fetch step, or edit /opt/nvidia-failover/proxy.env then restart"
+echo -e "   Update    : bash proxmox-lxc.sh update ${CT_ID}   (or edit /opt/nvidia-failover/proxy.env then restart)"
 echo
